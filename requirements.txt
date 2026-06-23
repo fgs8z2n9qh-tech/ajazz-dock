@@ -1,0 +1,9 @@
+hidapi>=0.14
+Pillow>=10
+keyboard>=0.13
+mouse>=0.7
+sounddevice>=0.4
+soundfile>=0.12
+pycaw>=20230407
+comtypes>=1.2
+PySide6-Essentials>=6.6

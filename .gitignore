@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+AjazzDock.spec
+
+# Logs
+*.log
+
+# Local/personal runtime configs & recovery snapshots
+# (the real config lives in %APPDATA%\AjazzDock, not in the repo)
+config_backup_*.json
+recovered_sandbox_config_*.json
+dev-config.json
+
+# Tool-generated temp images
+tools/_*.png
+tools/_*.jpg
+
+# Dev/test screenshots, montages & generated renders under assets/
+# (keep only the app icon; the configurator screenshots can leak personal layout)
+assets/*
+!assets/ajazzdock.ico
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store

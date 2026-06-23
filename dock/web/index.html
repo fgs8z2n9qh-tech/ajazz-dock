@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AjazzDock — Configurator</title>
+<style>
+  :root{
+    --bg:#13161b; --panel:#1b1f27; --panel2:#222732; --line:#2c3340;
+    --txt:#e6e9ef; --dim:#9aa3b2; --accent:#3d8bff; --accent2:#2a6fd6;
+    --ok:#34c759; --bad:#ff5b5b; --chip:#2a3140;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 "Segoe UI",system-ui,sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);
+    border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+  header h1 small{color:var(--dim);font-weight:400}
+  .spacer{flex:1}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:6px}
+  .dot.on{background:var(--ok)}
+  select,input,textarea,button{font:inherit;color:var(--txt);background:var(--panel2);
+    border:1px solid var(--line);border-radius:7px;padding:6px 9px;outline:none}
+  select:focus,input:focus,textarea:focus{border-color:var(--accent)}
+  button{cursor:pointer;background:var(--chip)}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent2);border-color:var(--accent)}
+  button.primary:hover{background:var(--accent)}
+  button.danger:hover{border-color:var(--bad);color:var(--bad)}
+  .layout{display:grid;grid-template-columns:minmax(420px,1fr) minmax(360px,460px);gap:18px;padding:18px;align-items:start}
+  @media (max-width:920px){.layout{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .row{display:flex;align-items:center;gap:10px}
+  .row.wrap{flex-wrap:wrap}
+  label.fld{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+  label.fld > *{color:var(--txt)}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  .tab{padding:5px 11px;border-radius:999px;background:var(--chip);border:1px solid var(--line);cursor:pointer;font-size:13px}
+  .tab.active{background:var(--accent2);border-color:var(--accent)}
+  .keys{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+  .key{aspect-ratio:1;border-radius:12px;border:2px solid var(--line);overflow:hidden;position:relative;
+    cursor:pointer;background:#000;display:flex;align-items:center;justify-content:center}
+  .key img{width:100%;height:100%;image-rendering:pixelated;display:block}
+  .key.sel{border-color:var(--accent);box-shadow:0 0 0 3px rgba(61,139,255,.25)}
+  .key .kid{position:absolute;left:5px;top:4px;font-size:10px;color:#fff;text-shadow:0 1px 2px #000;opacity:.8}
+  .subhead{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);margin:6px 0 8px}
+  .btns,.encs{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .slot{border:1px solid var(--line);border-radius:10px;background:var(--panel2);padding:9px;cursor:pointer}
+  .slot.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(61,139,255,.2)}
+  .slot .t{font-size:11px;color:var(--dim)}
+  .slot .a{font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .enc{display:flex;flex-direction:column;gap:6px}
+  .enc .triple{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}
+  .mini{border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:6px 4px;text-align:center;cursor:pointer;font-size:11px}
+  .mini.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(61,139,255,.2)}
+  .mini .a{color:var(--dim);font-size:10px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .editor h2{font-size:14px;margin:0 0 12px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .preview{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  .preview img{width:90px;height:90px;border-radius:10px;border:1px solid var(--line);image-rendering:pixelated;background:#000}
+  .emoji-pick{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+  .emoji-pick span{cursor:pointer;font-size:18px;padding:2px 4px;border-radius:6px}
+  .emoji-pick span:hover{background:var(--chip)}
+  .hint{color:var(--dim);font-size:12px}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);
+    border:1px solid var(--line);padding:10px 16px;border-radius:10px;opacity:0;transition:.25s;pointer-events:none}
+  .toast.show{opacity:1}
+  input[type=color]{padding:2px;height:34px;width:46px}
+  input[type=range]{accent-color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>AjazzDock <small>— AKP03 configurator</small></h1>
+  <span id="conn"><span class="dot"></span>…</span>
+  <div class="spacer"></div>
+  <label class="fld" style="flex-direction:row;align-items:center;gap:6px">Profile
+    <select id="profileSel"></select></label>
+  <button id="addProfile" title="New profile">＋</button>
+  <label class="fld" style="flex-direction:row;align-items:center;gap:6px">Brightness
+    <input type="range" id="bright" min="0" max="100" style="width:120px"></label>
+  <button id="reloadBtn">Reload</button>
+  <button id="saveBtn" class="primary">Save</button>
+</header>
+
+<div class="layout">
+  <div class="card device">
+    <div class="tabs" id="pageTabs"></div>
+    <div class="keys" id="keys"></div>
+    <div class="subhead">Buttons</div>
+    <div class="btns" id="btns"></div>
+    <div class="subhead" style="margin-top:16px">Encoders (turn ◀ · push · turn ▶)</div>
+    <div class="encs" id="encs"></div>
+  </div>
+
+  <div class="card editor">
+    <h2 id="edTitle">Select a key</h2>
+    <div id="edBody" class="hint">Click any key, button, or encoder slot on the left to edit what it does.</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const EMOJIS = ["🎵","🎙️","🔊","🔉","🔇","⏯️","⏭️","⏮️","⏹️","🌐","📁","📝","💬","📧","🖥️","🎮","📷","🎬","🔒","⚙️","🚀","🏠","➡️","⬅️","⭐","❤️","✅","🔥","💡","🖼️","🎨","🧠","☕","🎧","📊","⌨️"];
+const ACTION_TYPES = ["none","open","hotkey","text","media","volume","mic","page","profile","brightness","macro"];
+const LCD=["key1","key2","key3","key4","key5","key6"], BTNS=["btn7","btn8","btn9"], ENC=[0,1,2];
+
+let cfg=null, status=null, sel=null;
+
+const $=(s,r=document)=>r.querySelector(s);
+const el=(t,a={},...kids)=>{const e=document.createElement(t);for(const k in a){if(k==="class")e.className=a[k];else if(k==="html")e.innerHTML=a[k];else if(k.startsWith("on"))e.addEventListener(k.slice(2),a[k]);else e.setAttribute(k,a[k]);}for(const c of kids)if(c!=null)e.append(c.nodeType?c:document.createTextNode(c));return e;};
+const toast=m=>{const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),1600);};
+
+async function api(path,opt){const r=await fetch(path,opt);return r.headers.get("content-type")?.includes("json")?r.json():r;}
+function activeProfile(){return cfg.profiles.find(p=>p.name===cfg.active_profile)||cfg.profiles[0];}
+let curPage=0;
+function pages(){return activeProfile().pages;}
+function page(){return pages()[Math.min(curPage,pages().length-1)];}
+function items(){return page().items||(page().items={});}
+
+async function load(){
+  cfg=await api("/api/config"); status=await api("/api/status");
+  curPage=Math.min(status.page_index||0, pages().length-1);
+  $("#bright").value=cfg.brightness;
+  renderProfiles(); renderConn(); renderAll();
+}
+function renderConn(){const c=$("#conn");c.innerHTML="";c.append(el("span",{class:"dot"+(status.connected?" on":"")}),status.connected?"Connected":"No device");}
+function renderProfiles(){
+  const s=$("#profileSel");s.innerHTML="";
+  cfg.profiles.forEach(p=>s.append(el("option",{value:p.name},p.name)));
+  s.value=cfg.active_profile;
+}
+function renderTabs(){
+  const t=$("#pageTabs");t.innerHTML="";
+  pages().forEach((p,i)=>{
+    t.append(el("div",{class:"tab"+(i===curPage?" active":""),onclick:()=>{curPage=i;renderAll();api("/api/goto",{method:"POST",headers:{ "Content-Type":"application/json"},body:JSON.stringify({page_index:i})});}},p.name||("Page "+(i+1))));
+  });
+  t.append(el("div",{class:"tab",title:"Add page",onclick:addPage},"＋"));
+  if(pages().length>1) t.append(el("div",{class:"tab",title:"Rename page",onclick:renamePage},"✎"));
+  if(pages().length>1) t.append(el("div",{class:"tab danger",title:"Delete page",onclick:delPage},"🗑"));
+}
+async function preview(img,item){
+  const r=await fetch("/api/render",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(item||{})});
+  const b=await r.blob(); if(img._u)URL.revokeObjectURL(img._u); img._u=URL.createObjectURL(b); img.src=img._u;
+}
+function actSummary(it){const a=it&&it.action;if(!a||!a.type||a.type==="none")return "—";
+  const x=a.type;const d={open:a.target,hotkey:a.keys,text:a.text,media:a.media,volume:a.volume,mic:a.mic,page:a.page,profile:a.name,brightness:a.value,macro:"macro"}[x];
+  return x+(d?": "+String(d).slice(0,16):"");}
+function renderKeys(){
+  const g=$("#keys");g.innerHTML="";
+  LCD.forEach(id=>{
+    const it=items()[id]; const img=el("img");
+    const k=el("div",{class:"key"+(sel===id?" sel":""),onclick:()=>select(id)},el("div",{class:"kid"},id),img);
+    g.append(k); preview(img,it||{});
+  });
+}
+function renderBtns(){
+  const g=$("#btns");g.innerHTML="";
+  BTNS.forEach(id=>{const it=items()[id]||{};
+    g.append(el("div",{class:"slot"+(sel===id?" sel":""),onclick:()=>select(id)},
+      el("div",{class:"t"},"Button "+id.slice(3)),el("div",{class:"a"},actSummary(it))));
+  });
+}
+function renderEncs(){
+  const g=$("#encs");g.innerHTML="";
+  ENC.forEach(n=>{
+    const ids={left:"enc"+n+"-",push:"enc"+n,right:"enc"+n+"+"};
+    const mk=(id,lbl)=>el("div",{class:"mini"+(sel===id?" sel":""),onclick:()=>select(id)},lbl,el("div",{class:"a"},actSummary(items()[id]||{})));
+    g.append(el("div",{class:"enc"},el("div",{class:"t",style:"font-size:11px;color:var(--dim)"},"Encoder "+n),
+      el("div",{class:"triple"},mk(ids.left,"◀"),mk(ids.push,"●"),mk(ids.right,"▶"))));
+  });
+}
+function renderAll(){renderTabs();renderKeys();renderBtns();renderEncs();renderEditor();}
+
+function select(id){sel=id;renderAll();}
+
+function field(label,node){return el("label",{class:"fld"},label,node);}
+function renderEditor(){
+  const title=$("#edTitle"), body=$("#edBody");
+  if(!sel){title.textContent="Select a key";body.innerHTML="Click any key, button, or encoder slot to edit it.";return;}
+  const it=items()[sel]||(items()[sel]={});
+  it.action=it.action||{type:"none"};
+  const isLcd=sel.startsWith("key");
+  title.textContent=(isLcd?"LCD "+sel:(sel.startsWith("btn")?"Button "+sel.slice(3):"Encoder "+sel.replace("enc","")));
+  body.innerHTML=""; const wrap=el("div");
+
+  if(isLcd){
+    const img=el("img"); preview(img,it);
+    const lab=el("input",{value:it.label||"",placeholder:"Label",oninput:e=>{it.label=e.target.value;refreshSlot(img,it);}});
+    const icon=el("input",{value:it.icon||"",placeholder:"emoji or image path",oninput:e=>{it.icon=e.target.value;refreshSlot(img,it);}});
+    const color=el("input",{type:"color",value:it.color||"#23272e",oninput:e=>{it.color=e.target.value;refreshSlot(img,it);}});
+    const tcol=el("input",{type:"color",value:it.text_color||"#ffffff",oninput:e=>{it.text_color=e.target.value;refreshSlot(img,it);}});
+    const palette=el("div",{class:"emoji-pick"});EMOJIS.forEach(em=>palette.append(el("span",{onclick:()=>{it.icon=em;icon.value=em;refreshSlot(img,it);}},em)));
+    wrap.append(el("div",{class:"preview"},img,el("div",{},field("Label",lab),field("Icon",icon))));
+    wrap.append(palette);
+    const fileInput=el("input",{type:"file",accept:"image/png,image/jpeg,image/bmp",style:"display:none",onchange:async e=>{
+      const f=e.target.files[0];if(!f)return;
+      const fd=new FormData();fd.append("file",f);
+      try{const r=await fetch("/api/upload",{method:"POST",body:fd});const j=await r.json();
+        if(j.ok){it.icon=j.path;icon.value=j.path;refreshSlot(img,it);toast("Image set ✓");}else toast("Upload failed: "+(j.error||""));}
+      catch(_){toast("Upload failed");}
+      e.target.value="";}});
+    wrap.append(el("div",{class:"row",style:"margin-top:8px"},
+      el("button",{onclick:()=>fileInput.click()},"🖼 Upload PNG…"),
+      el("button",{class:"danger",title:"Remove icon",onclick:()=>{it.icon="";icon.value="";refreshSlot(img,it);}},"Clear icon"),
+      fileInput,el("span",{class:"hint"},"PNG/JPG — square works best")));
+    wrap.append(el("div",{class:"grid2",style:"margin-top:10px"},field("Background",color),field("Text color",tcol)));
+    wrap._img=img;
+  }else{
+    wrap.append(el("div",{class:"hint",style:"margin-bottom:10px"},"This control has no screen — set its action."));
+  }
+  wrap.append(el("div",{class:"subhead",style:"margin-top:14px"},"Action"));
+  wrap.append(renderAction(it,wrap._img));
+  body.append(wrap);
+}
+function refreshSlot(img,it){preview(img,it);clearTimeout(refreshSlot._t);refreshSlot._t=setTimeout(()=>{renderKeys();renderBtns();renderEncs();},150);}
+
+function renderAction(it,faceImg){
+  const a=it.action; const box=el("div");
+  const typeSel=el("select",{onchange:e=>{it.action={type:e.target.value};renderEditorBody(it,faceImg);}});
+  ACTION_TYPES.forEach(t=>typeSel.append(el("option",{value:t,...(t===a.type?{selected:"selected"}:{})},t)));
+  box.append(field("Type",typeSel));
+  box.append(renderActionFields(it,faceImg));
+  return box;
+}
+function renderEditorBody(it,faceImg){ // re-render just action area
+  const body=$("#edBody"); const old=body.querySelector(".actionFields");
+  if(old)old.remove();
+  body.append(Object.assign(renderActionFields(it,faceImg)));
+  // also refresh type select selection & slot summaries
+  refreshSlot(faceImg||el("img"),it);
+}
+function renderActionFields(it,faceImg){
+  const a=it.action, box=el("div",{class:"actionFields",style:"margin-top:8px"});
+  const set=(k,v)=>{a[k]=v;};
+  const txt=(k,ph)=>el("input",{value:a[k]||"",placeholder:ph||"",oninput:e=>set(k,e.target.value)});
+  const opts=(k,arr,def)=>{const s=el("select",{onchange:e=>set(k,e.target.value)});arr.forEach(o=>s.append(el("option",{value:o,...((a[k]||def)===o?{selected:"selected"}:{})},o)));if(!a[k])set(k,def);return s;};
+  switch(a.type){
+    case "open": box.append(field("Target (app / file / folder / URL)",txt("target","notepad.exe or https://…")),field("Args (optional)",txt("args",""))); break;
+    case "hotkey": box.append(field("Keys (e.g. ctrl+shift+t, win+e)",txt("keys","ctrl+c"))); break;
+    case "text": box.append(field("Text to type",el("textarea",{rows:3,oninput:e=>set("text",e.target.value)},a.text||""))); break;
+    case "media": box.append(field("Media",opts("media",["play_pause","next","prev","stop"],"play_pause"))); break;
+    case "volume": box.append(field("Volume",opts("volume",["up","down","mute"],"up")),field("Step (turns/clicks)",el("input",{type:"number",min:1,value:a.step||1,oninput:e=>set("step",+e.target.value)}))); break;
+    case "mic": box.append(field("Microphone",opts("mic",["toggle","mute","unmute"],"toggle"))); break;
+    case "page": box.append(field("Page",opts("page",["next","prev","goto"],"next")),field("Go to index (for goto)",el("input",{type:"number",min:0,value:a.target||0,oninput:e=>set("target",+e.target.value)}))); break;
+    case "profile":{const s=el("select",{onchange:e=>set("name",e.target.value)});cfg.profiles.forEach(p=>s.append(el("option",{value:p.name,...(a.name===p.name?{selected:"selected"}:{})},p.name)));if(!a.name&&cfg.profiles[0])set("name",cfg.profiles[0].name);box.append(field("Switch to profile",s));break;}
+    case "brightness": box.append(field("Brightness 0–100",el("input",{type:"number",min:0,max:100,value:a.value??70,oninput:e=>set("value",+e.target.value)}))); break;
+    case "macro": box.append(field("Steps (JSON array of actions)",el("textarea",{rows:5,oninput:e=>{try{a.steps=JSON.parse(e.target.value);}catch(_){}}},JSON.stringify(a.steps||[],null,1)))); break;
+    default: box.append(el("div",{class:"hint"},"No action — this control does nothing."));
+  }
+  if(a.type&&a.type!=="none"){
+    box.append(el("div",{class:"row",style:"margin-top:12px"},
+      el("button",{onclick:()=>api("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:a})}).then(()=>toast("Tested action"))},"▶ Test"),
+      el("button",{class:"danger",onclick:()=>{delete items()[sel];sel&&select(sel);toast("Cleared");}},"Clear binding")));
+  }
+  return box;
+}
+
+// ---- profile / page management ----
+function addPage(){pages().push({name:"Page "+(pages().length+1),items:{}});curPage=pages().length-1;renderAll();}
+function renamePage(){const n=prompt("Page name:",page().name);if(n){page().name=n;renderAll();}}
+function delPage(){if(pages().length<2)return;if(confirm("Delete page '"+page().name+"'?")){pages().splice(curPage,1);curPage=Math.max(0,curPage-1);renderAll();}}
+$("#addProfile").onclick=()=>{const n=prompt("New profile name:");if(!n)return;if(cfg.profiles.some(p=>p.name===n)){toast("Name exists");return;}cfg.profiles.push({name:n,pages:[{name:"Home",items:{}}]});cfg.active_profile=n;curPage=0;renderProfiles();$("#profileSel").value=n;renderAll();};
+$("#profileSel").onchange=e=>{cfg.active_profile=e.target.value;curPage=0;sel=null;renderAll();api("/api/goto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({profile:e.target.value})});};
+$("#bright").oninput=e=>{cfg.brightness=+e.target.value;clearTimeout($("#bright")._t);$("#bright")._t=setTimeout(()=>api("/api/brightness",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({value:cfg.brightness})}),120);};
+$("#saveBtn").onclick=async()=>{await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});toast("Saved ✓");status=await api("/api/status");renderConn();};
+$("#reloadBtn").onclick=async()=>{await load();toast("Reloaded");};
+
+// poll connection status
+setInterval(async()=>{try{status=await api("/api/status");renderConn();}catch(_){}} ,2500);
+load();
+</script>
+</body>
+</html>
