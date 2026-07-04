@@ -192,7 +192,7 @@ class AKP03:
 
     def _write(self, frame: bytes) -> None:
         if not self.dev:
-            raise RuntimeError("device not open")
+            raise OSError("device not open")   # OSError (not RuntimeError) so the loop's reconnect path catches it
         self.dev.write(frame)
 
     # ---- protocol ----------------------------------------------------------
@@ -243,7 +243,7 @@ class AKP03:
     # ---- input -------------------------------------------------------------
     def read_event(self, timeout_ms: int = 200) -> Optional[Event]:
         if not self.dev:
-            raise RuntimeError("device not open")
+            raise OSError("device not open")   # OSError (not RuntimeError) so the loop's reconnect path catches it
         data = self.dev.read(512, timeout_ms)
         if not data or len(data) < 11:
             return None

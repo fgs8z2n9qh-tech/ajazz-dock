@@ -40,11 +40,11 @@ async def _connect(host: str, user: str, pw: str):
     return dev
 
 
-def _get_dev(host: str, user: str, pw: str, reconnect: bool = False):
+def _get_dev(host: str, user: str, pw: str, reconnect: bool = False, timeout: float = 20.0):
     with _dev_lock:
         dev = _devices.get(host)
     if dev is None or reconnect:
-        dev = _run(_connect(host, user, pw))
+        dev = _run(_connect(host, user, pw), timeout=timeout)
         with _dev_lock:
             _devices[host] = dev
     return dev
@@ -130,9 +130,11 @@ def apply(host: str, user: str, pw: str, mode: str,
         return _run(_do(dev))
 
 
-def is_on(host: str, user: str, pw: str) -> bool:
-    dev = _get_dev(host, user, pw)
-    _run(dev.update())
+def is_on(host: str, user: str, pw: str, timeout: float = 5.0) -> bool:
+    # Short timeout (not _run's 20s default): the LIGHT live-key sampler polls this every ~1.5s,
+    # so a bulb that drops off the network must not freeze the live face for 20s per tick.
+    dev = _get_dev(host, user, pw, timeout=timeout)
+    _run(dev.update(), timeout=timeout)
     return bool(dev.is_on)
 
 

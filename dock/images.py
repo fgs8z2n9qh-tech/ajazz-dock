@@ -822,6 +822,21 @@ def _glyph_bulb(d, cx, cy, s, on, lw):
             d.line([(x, y), (x2, y2)], fill=col, width=lw)
 
 
+def _glyph_rgb(d, cx, cy, s, on, lw):
+    """RGB lights — three overlapping R/G/B discs (the additive-colour mark); grey rings when off."""
+    r = s * 0.62
+    o = s * 0.46
+    trio = ((cx, cy - o, (255, 66, 74)),
+            (cx - o * 0.95, cy + o * 0.62, (70, 214, 108)),
+            (cx + o * 0.95, cy + o * 0.62, (74, 132, 255)))
+    for px, py, col in trio:
+        box = [px - r, py - r, px + r, py + r]
+        if on:
+            d.ellipse(box, fill=col)
+        else:
+            d.ellipse(box, outline=_OFFCOL, width=lw)
+
+
 def _glyph_discord(d, cx, cy, s, on, lw):
     """A headset (Discord voice) — Discord-style FILLED. Muted/deafened -> red + cut slash; live -> mint."""
     col = _ALERT if on else _ON
@@ -936,7 +951,7 @@ def _glyph_obs_replay(d, cx, cy, s, on, lw):
         d.line([(cx + dx - s * 0.2, cy), (cx + dx + s * 0.55, cy + s * 0.8)], fill=col, width=lw)
 
 
-_STATE_GLYPHS = {"MIC": _glyph_mic, "CAPS": _glyph_caps, "LIGHT": _glyph_bulb,
+_STATE_GLYPHS = {"MIC": _glyph_mic, "CAPS": _glyph_caps, "LIGHT": _glyph_bulb, "RGB": _glyph_rgb,
                  "DISCORD": _glyph_discord, "DMIC": _glyph_mic, "DDEAF": _glyph_deaf,
                  "DCALL": _glyph_call, "DMODE": _glyph_dmode, "DNOISE": _glyph_dnoise,
                  "STREAM": _glyph_obs_stream, "REC": _glyph_obs_rec,

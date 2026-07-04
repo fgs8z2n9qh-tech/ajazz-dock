@@ -53,6 +53,7 @@ _META: Dict[str, Tuple[str, str]] = {
     "mic":       ("Mic mute state", "state"),
     "caps":      ("Caps Lock state", "state"),
     "light":     ("Smart bulb on/off", "state"),
+    "rgb":       ("RGB lights on/off", "state"),
     "discord":   ("Discord mute / deafen", "state"),
     "discord_mic": ("Discord mic mute", "state"),
     "discord_deaf": ("Discord deafen", "state"),
@@ -95,7 +96,8 @@ LIVE_SHORT: Dict[str, str] = {
     "vram": "VRAM used", "vram_temp": "VRAM temp", "gpu_fan": "GPU fan",
     "disk": "Disk", "net": "Net down", "net_up": "Net up",
     "battery": "Battery", "uptime": "Uptime", "procs": "Processes",
-    "mic": "Mic", "caps": "Caps Lock", "light": "Smart bulb", "discord": "Discord", "media": "Now playing",
+    "mic": "Mic", "caps": "Caps Lock", "light": "Smart bulb", "rgb": "RGB lights",
+    "discord": "Discord", "media": "Now playing",
     "weather": "Weather",
     "wx_feels": "Feels like", "wx_humidity": "Humidity", "wx_wind": "Wind", "wx_uv": "UV index",
     "wx_precip": "Rain chance", "wx_hi": "Today high", "wx_lo": "Today low",
@@ -117,7 +119,7 @@ LIVE_EMOJI: Dict[str, str] = {
     "vram": "🎞️", "vram_temp": "🌡️", "gpu_fan": "🌀",
     "disk": "💽", "net": "🔽", "net_up": "🔼",
     "battery": "🔋", "uptime": "⏳", "procs": "🔢",
-    "mic": "🎙️", "caps": "🔠", "light": "💡", "discord": "💬", "media": "🎵",
+    "mic": "🎙️", "caps": "🔠", "light": "💡", "rgb": "🌈", "discord": "💬", "media": "🎵",
     "discord_mic": "🎙️", "discord_deaf": "🎧", "discord_voice": "📞", "discord_count": "👥",
     "discord_invol": "🎚️", "discord_outvol": "🔊", "discord_mode": "🎯", "discord_noise": "🛡️",
     "obs_streaming": "🔴", "obs_recording": "⏺️", "obs_virtualcam": "📹", "obs_scene": "🎬", "obs_replay": "⏮️",
@@ -133,7 +135,7 @@ LIVE_CATEGORIES = [
     ("Graphics", ["gpu", "gpu_clock", "gpu_temp", "vram", "vram_temp", "gpu_fan"]),
     ("Storage & network", ["disk", "net", "net_up"]),
     ("Power & system", ["battery", "uptime", "procs"]),
-    ("Status", ["mic", "caps", "light"]),
+    ("Status", ["mic", "caps", "light", "rgb"]),
     ("Discord", ["discord", "discord_mic", "discord_deaf", "discord_voice", "discord_count",
                  "discord_invol", "discord_outvol", "discord_mode", "discord_noise"]),
     ("OBS Studio", ["obs_streaming", "obs_recording", "obs_virtualcam", "obs_scene", "obs_replay"]),
@@ -260,91 +262,214 @@ def _lhm_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
 
 
+# The LibreHardwareMonitor sweep touches .NET (pythonnet) + ring0 hardware access, which can
+# NATIVELY access-violate on some driver/hardware states (GPU sleep/reset, ADLX). A native crash
+# can't be caught by try/except and would take the whole app down silently. So it runs in an
+# ISOLATED child process (run.py --lhm-worker): if the sensor code crashes, only the child dies and
+# the supervisor respawns it; the main app never imports the CLR and keeps running (temps -> "--").
+
+def _read_lhm_once(comp) -> dict:
+    """One sensor sweep -> readings dict. Runs in the WORKER process (a native fault dies HERE)."""
+    cpu = cpu_pref = gpu_t = gpu_t_core = gpu_load = None
+    gpu_clk = gpu_fan = vram_t = vram_u = vram_tot = None
+    for hw in comp.Hardware:
+        try:
+            hw.Update()
+        except Exception:
+            continue
+        ht = str(hw.HardwareType)
+        if ht != "Cpu" and not ht.startswith("Gpu"):
+            continue
+        is_gpu = ht.startswith("Gpu")
+        for s in hw.Sensors:
+            if s.Value is None:
+                continue
+            st = str(s.SensorType)
+            v = float(s.Value)
+            name = str(s.Name)
+            if st == "Temperature":
+                if ht == "Cpu":
+                    cpu = v if cpu is None else max(cpu, v)
+                    if any(k in name for k in ("Tctl", "Tdie", "Package")):
+                        cpu_pref = v
+                else:                          # Gpu*
+                    if name == "GPU Memory":
+                        vram_t = v
+                    elif "Core" in name:
+                        gpu_t_core = v
+                    elif gpu_t is None:
+                        gpu_t = v
+            elif st == "Load" and is_gpu and name == "GPU Core":
+                gpu_load = v if gpu_load is None else max(gpu_load, v)
+            elif st == "Clock" and is_gpu and name == "GPU Core":
+                gpu_clk = v
+            elif st == "Fan" and is_gpu:
+                gpu_fan = v if gpu_fan is None else max(gpu_fan, v)
+            elif st == "SmallData" and is_gpu:
+                if name == "GPU Memory Used":
+                    vram_u = v
+                elif name == "GPU Memory Total":
+                    vram_tot = v
+    cpu_v = cpu_pref if cpu_pref is not None else cpu
+    gpu_v = gpu_t_core if gpu_t_core is not None else gpu_t
+    return {
+        "cpu": cpu_v if (cpu_v and cpu_v > 0) else None,
+        "gpu": gpu_v if (gpu_v and gpu_v > 0) else None,
+        "gpu_load": gpu_load,
+        "gpu_clock": gpu_clk,
+        "gpu_fan": gpu_fan,
+        "vram_temp": vram_t if (vram_t and vram_t > 0) else None,
+        "vram_used": vram_u,
+        "vram_total": vram_tot,
+    }
+
+
+def _parent_alive(ppid: int) -> bool:
+    if not ppid:
+        return True
+    try:
+        import psutil
+        return psutil.pid_exists(ppid)
+    except Exception:
+        return True                          # can't tell -> assume alive (parent atexit still kills us)
+
+
+def lhm_worker_main(out_path: str, ppid: int = 0) -> None:
+    """WORKER-PROCESS entry (run.py `--lhm-worker`): open LibreHardwareMonitor and publish readings
+    to `out_path` as JSON, one sweep per second. Isolated so a native sensor crash dies HERE."""
+    import os
+    import json
+    try:
+        import clr                            # pythonnet
+        d = _lhm_dir()
+        for shim in _LHM_SHIMS:                # 0.9.6 needs these netstandard shims
+            p = os.path.join(d, shim + ".dll")
+            if os.path.exists(p):
+                try:
+                    clr.AddReference(p)
+                except Exception:
+                    pass
+        clr.AddReference(os.path.join(d, "LibreHardwareMonitorLib.dll"))
+        from LibreHardwareMonitor.Hardware import Computer  # type: ignore
+        comp = Computer()
+        comp.IsCpuEnabled = True
+        comp.IsGpuEnabled = True
+        comp.Open()
+    except Exception:
+        return
+    tmp = out_path + ".tmp"
+    while _parent_alive(ppid):
+        data = _read_lhm_once(comp)
+        data["ts"] = time.time()
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, out_path)          # atomic publish -> parent never reads a half-written file
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+# ---- parent-side worker supervision -----------------------------------------------------------
+_lhm_proc = None
+_lhm_out = None
+_lhm_shutdown = False                        # set at app exit so the supervisor stops respawning the worker
+
+
+def _lhm_spawn() -> None:
+    global _lhm_proc, _lhm_out
+    import os
+    import sys
+    import subprocess
+    import tempfile
+    if _lhm_out is None:
+        _lhm_out = os.path.join(tempfile.gettempdir(), f"hexpad_lhm_{os.getpid()}.json")
+    try:
+        if os.path.exists(_lhm_out):
+            os.remove(_lhm_out)
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        args = [sys.executable, "--lhm-worker", _lhm_out, str(os.getpid())]
+    else:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        args = [sys.executable, os.path.join(root, "run.py"), "--lhm-worker", _lhm_out, str(os.getpid())]
+    _lhm_proc = subprocess.Popen(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=0x08000000)            # CREATE_NO_WINDOW (elevated parent -> child inherits, no UAC)
+
+
+def _lhm_kill() -> None:
+    global _lhm_proc
+    p, _lhm_proc = _lhm_proc, None
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _lhm_cleanup() -> None:
+    global _lhm_shutdown
+    _lhm_shutdown = True                      # stop the supervisor respawning the worker during shutdown
+    _lhm_kill()
+    try:
+        import os
+        if _lhm_out and os.path.exists(_lhm_out):
+            os.remove(_lhm_out)
+    except Exception:
+        pass
+
+
 def _start_lhm() -> None:
+    """Idempotently start the supervisor: keep an isolated LHM worker alive while a GPU/temp key
+    consumes it, read its published JSON into `_lhm`, and respawn it (with backoff) if it crashes."""
     global _lhm_started
-    _touch("lhm")                        # every consumer call keeps the sampler awake / wakes it
+    _touch("lhm")                            # every consumer call keeps the worker awake / wakes it
     if _lhm_started:
         return
     _lhm_started = True
 
-    def run() -> None:
-        try:
-            import os
-            import clr                                   # pythonnet (lazy; degrades to "--")
-            d = _lhm_dir()
-            for shim in _LHM_SHIMS:                       # 0.9.6 needs these netstandard shims
-                p = os.path.join(d, shim + ".dll")
-                if os.path.exists(p):
-                    try:
-                        clr.AddReference(p)
-                    except Exception:
-                        pass
-            clr.AddReference(os.path.join(d, "LibreHardwareMonitorLib.dll"))
-            from LibreHardwareMonitor.Hardware import Computer  # type: ignore
-            comp = Computer()
-            comp.IsCpuEnabled = True
-            comp.IsGpuEnabled = True
-            comp.Open()
-            while True:
-                _park_if_idle("lhm")                      # park when no GPU/temp key consumes it
-                cpu = cpu_pref = gpu_t = gpu_t_core = gpu_load = None
-                gpu_clk = gpu_fan = vram_t = vram_u = vram_tot = None
-                for hw in comp.Hardware:
-                    try:
-                        hw.Update()
-                    except Exception:
-                        continue
-                    ht = str(hw.HardwareType)
-                    if ht != "Cpu" and not ht.startswith("Gpu"):
-                        continue
-                    is_gpu = ht.startswith("Gpu")
-                    for s in hw.Sensors:
-                        if s.Value is None:
-                            continue
-                        st = str(s.SensorType)
-                        v = float(s.Value)
-                        name = str(s.Name)
-                        if st == "Temperature":
-                            if ht == "Cpu":
-                                cpu = v if cpu is None else max(cpu, v)
-                                if any(k in name for k in ("Tctl", "Tdie", "Package")):
-                                    cpu_pref = v
-                            else:                          # Gpu*
-                                if name == "GPU Memory":
-                                    vram_t = v
-                                elif "Core" in name:
-                                    gpu_t_core = v
-                                elif gpu_t is None:
-                                    gpu_t = v
-                        elif st == "Load" and is_gpu and name == "GPU Core":
-                            gpu_load = v if gpu_load is None else max(gpu_load, v)
-                        elif st == "Clock" and is_gpu and name == "GPU Core":
-                            gpu_clk = v
-                        elif st == "Fan" and is_gpu:
-                            gpu_fan = v if gpu_fan is None else max(gpu_fan, v)
-                        elif st == "SmallData" and is_gpu:
-                            if name == "GPU Memory Used":
-                                vram_u = v
-                            elif name == "GPU Memory Total":
-                                vram_tot = v
-                cpu_v = cpu_pref if cpu_pref is not None else cpu
-                gpu_v = gpu_t_core if gpu_t_core is not None else gpu_t
+    def supervise() -> None:
+        import json
+        backoff = 0.0
+        while not _lhm_shutdown:
+            if time.monotonic() - _last_read.get("lhm", 0.0) > _IDLE_GRACE:
+                _lhm_kill()                   # no GPU/temp key -> stop sweeping
                 with _lhm_lock:
-                    _lhm["cpu"] = cpu_v if (cpu_v and cpu_v > 0) else None
-                    _lhm["gpu"] = gpu_v if (gpu_v and gpu_v > 0) else None
-                    _lhm["gpu_load"] = gpu_load
-                    _lhm["gpu_clock"] = gpu_clk
-                    _lhm["gpu_fan"] = gpu_fan
-                    _lhm["vram_temp"] = vram_t if (vram_t and vram_t > 0) else None
-                    _lhm["vram_used"] = vram_u
-                    _lhm["vram_total"] = vram_tot
-                time.sleep(1.0)
-        except Exception:
-            with _lhm_lock:
-                _lhm["cpu"] = _lhm["gpu"] = _lhm["gpu_load"] = None
+                    for k in _lhm:
+                        _lhm[k] = None
+            _park_if_idle("lhm")              # block at zero cost until a consumer calls _touch()
+            if not _lhm_shutdown and (_lhm_proc is None or _lhm_proc.poll() is not None):
+                if _lhm_proc is not None:      # the worker exited/crashed -> clear stale readings
+                    with _lhm_lock:
+                        for k in _lhm:
+                            _lhm[k] = None
+                if backoff:
+                    time.sleep(backoff)
+                try:
+                    _lhm_spawn()
+                except Exception:
+                    pass
+                backoff = min(10.0, (backoff or 1.0) * 2)   # ramp respawn delay if it keeps dying
+            try:
+                with open(_lhm_out, encoding="utf-8") as f:
+                    data = json.load(f)
+                if time.time() - data.get("ts", 0.0) < 5.0:
+                    backoff = 0.0             # a healthy sample -> reset the respawn backoff
+                    with _lhm_lock:
+                        for k in _lhm:
+                            _lhm[k] = data.get(k)
+                else:
+                    _lhm_kill()               # stale -> the worker hung; the poll()-branch respawns it
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     _arm_park("lhm")
-    threading.Thread(target=run, name="lhm-sampler", daemon=True).start()
+    import atexit
+    atexit.register(_lhm_cleanup)
+    threading.Thread(target=supervise, name="lhm-supervisor", daemon=True).start()
 
 
 def _gpu() -> Tuple[str, str, Optional[float]]:
@@ -584,6 +709,55 @@ def _light() -> Tuple[str, str, Optional[float]]:
     if on is None:
         return "--", "LIGHT", None
     return ("ON" if on else "OFF"), "LIGHT", (1.0 if on else 0.0)
+
+
+# ---- Prisma (RGB) on/off ---------------------------------------------------------------------
+# Prisma can't report its state, so the RGB live key reflects what the dock last COMMANDED
+# (set_rgb_state) combined with whether Prisma is running (process gone -> lights off).
+_rgb_lock = threading.Lock()
+_rgb_on: Optional[bool] = None
+_RGB_PROC = ("prisma.exe", "rgbcommander.exe")
+_rgb_run_cache = (0.0, True)                      # (checked_at, running) — throttle process_iter to ~2s
+
+
+def set_rgb_state(on: Optional[bool]) -> None:
+    """Optimistically record Prisma's on/off (Prisma can't be polled) so the RGB live key updates
+    the instant the dock fires a colour/effect/off/toggle action."""
+    global _rgb_on
+    with _rgb_lock:
+        _rgb_on = on
+
+
+def _rgb_running() -> bool:
+    global _rgb_run_cache
+    at, val = _rgb_run_cache
+    now = time.monotonic()
+    if now - at < 2.0:
+        return val
+    running = True
+    if psutil is not None:
+        running = False
+        try:
+            for p in psutil.process_iter(["name"]):
+                if (p.info.get("name") or "").lower() in _RGB_PROC:
+                    running = True
+                    break
+        except Exception:
+            running = True
+    _rgb_run_cache = (now, running)
+    return running
+
+
+def rgb_is_on() -> bool:
+    """Effective RGB state: on when Prisma is running and the dock hasn't turned it off."""
+    with _rgb_lock:
+        cmd = _rgb_on
+    return _rgb_running() and cmd is not False
+
+
+def _rgb_state() -> Tuple[str, str, Optional[float]]:
+    on = rgb_is_on()
+    return ("ON" if on else "OFF"), "RGB", (1.0 if on else 0.0)
 
 
 # Discord voice state (self-mute / deafen / in-call / volume / mode) via the local RPC — sampler.
@@ -907,8 +1081,9 @@ def _start_media_sampler() -> None:
             pos_s = dur_s = None                                     # track position for a progress bar
             try:
                 tl = s.get_timeline_properties()
-                pos_s = tl.position.total_seconds()
-                dur_s = tl.end_time.total_seconds() - tl.start_time.total_seconds()
+                start_s = tl.start_time.total_seconds()
+                pos_s = tl.position.total_seconds() - start_s   # position is absolute -> make it relative to start
+                dur_s = tl.end_time.total_seconds() - start_s
             except Exception:
                 pos_s = dur_s = None
             art = _KEEP
@@ -1382,7 +1557,7 @@ _PROVIDERS: Dict[str, Callable[[], Tuple[str, str, Optional[float]]]] = {
     "gpu_clock": _gpu_clock, "gpu_fan": _gpu_fan, "ram_gb": _ram_gb, "swap": _swap,
     "disk": _disk, "battery": _battery, "net": _net, "net_up": _net_up,
     "uptime": _uptime, "procs": _procs,
-    "mic": _mic, "caps": _caps, "light": _light, "discord": _discord_src,
+    "mic": _mic, "caps": _caps, "light": _light, "rgb": _rgb_state, "discord": _discord_src,
     "discord_mic": _discord_mic, "discord_deaf": _discord_deaf,
     "discord_voice": _discord_voice, "discord_count": _discord_count,
     "discord_invol": _discord_invol, "discord_outvol": _discord_outvol,

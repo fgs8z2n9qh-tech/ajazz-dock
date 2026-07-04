@@ -11,7 +11,8 @@ for sid in live.source_ids():
     text, caption, frac, kind = live.value(sid)
     assert isinstance(text, str) and isinstance(caption, str), (sid, text, caption)
     assert frac is None or 0.0 <= frac <= 1.0, (sid, frac)
-    assert kind in ("percent", "battery", "clock", "date", "net", "state", "gauge", "media", "vol"), (sid, kind)
+    assert kind in ("percent", "battery", "clock", "date", "net", "state", "gauge", "media", "vol",
+                    "weather", "wxforecast", "wxmetric"), (sid, kind)
     print(f"  live {sid:10} -> {text!r:>11} {caption!r:>10} frac={frac} kind={kind}")
 print("OK all live sources return (text, caption, frac, kind)")
 
@@ -55,6 +56,6 @@ c.page_index = 0
 assert c._face_for_index(0).size == images.KEY_SIZE
 print("OK controller renders live key via live_face")
 prof["pages"][0]["panel"] = {"path": gifp, "fps": 10, "gap": 22}
-assert c._setup_panel(prof["pages"][0]["panel"]) is True and len(c._panel["frames"]) == 3
+assert c._setup_panel(prof["pages"][0]["panel"]) is True and len(c._panel["jpeg"]) == 3   # frames pre-encoded to JPEG
 print("OK controller sets up animated panel")
 print("\nALL OK")

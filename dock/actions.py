@@ -756,10 +756,13 @@ class ActionEngine:
             self._quick(action.get("op"))
         elif t == "macro":
             for step in action.get("steps", []):
-                if (step.get("type") or "").lower() == "delay":
-                    time.sleep(max(0, int(step.get("ms", 0))) / 1000.0)
-                else:
-                    self._dispatch(step)
+                try:
+                    if (step.get("type") or "").lower() == "delay":
+                        time.sleep(max(0, int(step.get("ms", 0))) / 1000.0)
+                    else:
+                        self._dispatch(step)
+                except Exception as e:                  # one bad step must not abort the rest of the macro
+                    print(f"[action] macro step {step.get('type')!r} failed: {e}")
         elif t == "smartlight":
             self._smartlight(action)
         elif t == "rgbscene":
@@ -1042,6 +1045,16 @@ class ActionEngine:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _rgb_mark(self, on: Optional[bool]) -> None:
+        """Record Prisma's on/off for the RGB live key and refresh it immediately (Prisma can't be polled)."""
+        try:
+            from . import live
+            live.set_rgb_state(on)
+        except Exception:
+            return
+        if self.controller is not None and hasattr(self.controller, "refresh_live"):
+            self.controller.refresh_live()
+
     def _rgbscene(self, action: Dict[str, Any]) -> None:
         """Drive Prisma via its CLI (a launch with args forwards to the running instance)."""
         exe = (action.get("exe") or _RGB_EXE).strip()
@@ -1058,6 +1071,7 @@ class ActionEngine:
             # Prisma can't report its level, so track a local estimate (seeded mid-scale) for the bar.
             self._rgb_est = max(0, min(100, (self._rgb_est if self._rgb_est is not None else 50) + d))
             self._hud(self._rgb_est, "RGB lights", accent=_HUD_MINT)
+            self._rgb_mark(True)                            # adjusting brightness -> RGB is on
             return
 
         # Encoder colour cycle: coalesce ticks into one `--color` per window; HUD tracks the dial.
@@ -1072,11 +1086,19 @@ class ActionEngine:
             r, g, b = colorsys.hsv_to_rgb(self._rgb_hue_est / 360.0, 1, 1)
             self._hud(int(self._rgb_hue_est), "RGB colour", unit="°", vmax=360,
                       accent=(int(r * 255), int(g * 255), int(b * 255)))
+            self._rgb_mark(True)                            # cycling colour -> RGB is on
             return
 
         args = self._rgb_args(mode, action)
         if args is None:
             return
+        if mode == "off":
+            self._rgb_mark(False)
+        elif mode == "toggle":
+            from . import live
+            self._rgb_mark(not live.rgb_is_on())
+        elif mode in ("color", "effect", "profile", "bright_set"):
+            self._rgb_mark(True)
 
         def work() -> None:
             try:

@@ -129,7 +129,7 @@ c._pending_switch = None
 c._apply_app_switch("OBS", None)
 assert c.config.data["active_profile"] == "OBS"
 c._apply_app_switch(None, 2)
-assert c._pending_page is not None and c._pending_page[1] == 2
+assert c._pending_page is not None and c._pending_page[2] == 2   # _pending_page = (folder, direction, idx)
 # manual-nav suppression
 c._pending_page = None; c._last_manual_nav = time.time()
 c._apply_app_switch(None, 0)

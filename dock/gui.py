@@ -644,6 +644,7 @@ class KeyTile(_HoverFX, QLabel):
         self.setToolTip("Click to edit · drag to another key to swap · right-click to copy / paste")
         self.setAcceptDrops(True)
         self._base_pix = None
+        self._face_key = None                 # (id(face), scale, dpr) of last applied face -> skip redundant rebuilds
         self._press_pos = None
         self._init_fx()
 
@@ -688,6 +689,13 @@ class KeyTile(_HoverFX, QLabel):
             self._apply_face()
 
     def set_face(self, pil):
+        # Skip the PIL->QPixmap + rounded-clip rebuild when face object, scale and DPR are unchanged.
+        # render_face() returns cached, stable-identity faces, so id() is a valid key; self._src keeps
+        # the object alive, so its id can't be recycled under us.
+        key = (id(pil), self._scale, _dpr(self))
+        if key == self._face_key and self._base_pix is not None:
+            return
+        self._face_key = key
         self._src = pil
         self._apply_face()
 
@@ -2368,6 +2376,7 @@ class LiveDataPickerDialog(QDialog):
         self._timer = QTimer(self)                       # keep the value previews ticking
         self._timer.timeout.connect(self._refresh_tiles)
         self._timer.start(1000)
+        self.finished.connect(lambda _=0: self._timer.stop())   # stop ticking ~24 sources/s once the dialog closes
         self.search.setFocus()
 
     def _grid(self, sources):

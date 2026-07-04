@@ -294,7 +294,8 @@ class DockController:
                 # or a tap awaiting a double. Once the hold has fired we stop spinning (the release
                 # arrives as an event regardless of poll rate) — avoids a busy-wait during a long hold.
                 gesture = bool(self._tap_pending) or any(
-                    not pr["hold_fired"] for pr in self._press.values())
+                    pr.get("hold_pending") and not pr["hold_fired"]
+                    for pr in self._press.values())
                 anim_idle = self._ambient is not None and self._ambient.get("anim")
                 fast = on and (self._anim or self._page_anim or self._calib or self._panel
                                or self._volume_hud or anim_idle)   # animated idle needs ~15 fps
@@ -708,7 +709,7 @@ class DockController:
         except OSError:
             return
         self._ambient = {"start": time.time(), "sig": None, "last_anim": 0.0, "anim": False,
-                         "media_last": 0.0, "media_state": None, "np": None}
+                         "media_last": 0.0, "media_state": None, "np": None, "wx": None}
         try:
             self._advance_ambient()
         except OSError:
@@ -738,8 +739,10 @@ class DockController:
             if st and st[3]:                                # something is playing -> cover takes over
                 self._ambient["np"] = st
                 return "playing"
-        if idle.get("weather", False) and live.weather_payload():
-            if int((now - self._ambient["start"]) / _AMBIENT_WX_CYCLE) % 2 == 1:
+        if idle.get("weather", False):
+            wx = live.weather_payload()
+            if wx and int((now - self._ambient["start"]) / _AMBIENT_WX_CYCLE) % 2 == 1:
+                self._ambient["wx"] = wx                # hand the payload to _advance_ambient (avoid a re-fetch)
                 return "weather"
         return "clock"
 
@@ -768,7 +771,9 @@ class DockController:
                 tiles = ambient_now_playing_tiles(title, artist, art, phase, playing,
                                                   pos=live.media_position())
             elif layer == "weather":
-                wx = live.weather_payload()
+                wx = amb.get("wx")
+                if not wx:                              # payload expired between pick and draw -> hold the frame
+                    return
                 sig = ("wx", hh, mm, drift, wx.get("temp"), wx.get("feels"), wx.get("cond"),
                        wx.get("night"), wx.get("hi"), wx.get("lo"), wx.get("label"))
                 if amb.get("sig") == sig:
@@ -1038,8 +1043,10 @@ class DockController:
                                 "binding": binding, "hold_fired": True}   # consumed; release no-ops
             self._fire_gesture(ev.kind, ev.index, binding, "double")
             return
+        hold_pending = (iid == "btn8") or self._nonempty_action(
+            self._gesture_action(binding, "hold"))     # only fast-poll a held key that has a hold to fire
         self._press[iid] = {"t": time.time(), "index": ev.index, "kind": ev.kind,
-                            "binding": binding, "hold_fired": False}
+                            "binding": binding, "hold_fired": False, "hold_pending": hold_pending}
 
     def _resolve_release(self, iid: str) -> None:
         pr = self._press.pop(iid, None)
