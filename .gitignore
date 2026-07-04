@@ -13,7 +13,7 @@ env/
 build/
 dist/
 *.manifest
-AjazzDock.spec
+*.spec
 
 # Logs
 *.log
@@ -31,7 +31,7 @@ tools/_*.jpg
 # Dev/test screenshots, montages & generated renders under assets/
 # (keep only the app icon; the configurator screenshots can leak personal layout)
 assets/*
-!assets/ajazzdock.ico
+!assets/hexpad.ico
 
 # OS cruft
 Thumbs.db

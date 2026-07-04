@@ -41,8 +41,19 @@ check("items() now = folder items", win.items().get("key1", {}).get("label") == 
 win.select("key1")
 check("editing a folder key", win.sel == "key1")
 
-win.select("key6")                                        # the Back tile
-check("clicking Back exits the folder", win.view_folder is None)
+win.select("key6")                                        # the Back tile — now editable, no exit
+check("Back tile selectable (stays in folder)", win.view_folder == "folder1" and win.sel == "key6")
+check("Back editor seeded defaults", win.cfg.folder("folder1").get("back", {}).get("icon") == "⬅️")
+
+win._set_face(win.cfg.folder("folder1")["back"], "icon", "🏠")
+check("Back icon customised", win.cfg.folder("folder1")["back"]["icon"] == "🏠")
+
+win._reset_back()
+_b = win.cfg.folder("folder1").get("back", {})
+check("Reset Back restores default look", _b.get("icon", "⬅️") == "⬅️" and _b.get("label", "Back") == "Back")
+
+win._exit_folder_edit()                                   # breadcrumb is the exit now
+check("breadcrumb exits the folder", win.view_folder is None)
 
 nid = win._new_folder_id()
 check("new folder id is unique", nid not in win.cfg.folders_of())

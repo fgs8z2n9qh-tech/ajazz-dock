@@ -6,4 +6,11 @@ sounddevice>=0.4
 soundfile>=0.12
 pycaw>=20230407
 comtypes>=1.2
+psutil>=5.9
+python-kasa==0.10.2
+websocket-client>=1.6
+winrt-Windows.Media.Control>=2.0
+winrt-Windows.Foundation>=2.0
+winrt-Windows.Storage.Streams>=2.0
+winrt-runtime>=2.0
 PySide6-Essentials>=6.6

@@ -1,23 +1,34 @@
-# Install AjazzDock to a stable per-user location with Start Menu + Desktop shortcuts.
-# Run build.ps1 first to produce dist\AjazzDock.exe.
+# Install Hexpad to a stable per-user location with Start Menu + Desktop shortcuts.
+# The app runs elevated (to read CPU temperature), so this installer self-elevates to stop a
+# running (elevated) instance and register an elevated autostart task. Run build.ps1 first.
+# NB: your settings live in %APPDATA%\AjazzDock and are NOT touched by this rebrand.
 $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$src = Join-Path $root 'dist\AjazzDock.exe'
+$src = Join-Path $root 'dist\Hexpad.exe'
 if (-not (Test-Path $src)) {
-  Write-Host "dist\AjazzDock.exe not found - run ./build.ps1 first." -ForegroundColor Red
+  Write-Host "dist\Hexpad.exe not found - run ./build.ps1 first." -ForegroundColor Red
   exit 1
 }
 
-$installDir = Join-Path $env:LOCALAPPDATA 'AjazzDock'
+# ---- self-elevate (needed to stop an elevated instance + create the /rl highest task) ----
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+  Write-Host "Requesting administrator rights (UAC) to install..." -ForegroundColor Cyan
+  Start-Process powershell -Verb RunAs -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($MyInvocation.MyCommand.Definition)`"")
+  exit
+}
+
+# Stop any running instance (new OR the old AjazzDock build) so we can overwrite / clean up.
+Get-Process Hexpad, AjazzDock -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
+
+$installDir = Join-Path $env:LOCALAPPDATA 'Hexpad'
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
-# Stop any running instance so we can overwrite the exe.
-Get-Process AjazzDock -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 700
-
-$exe = Join-Path $installDir 'AjazzDock.exe'
+$exe = Join-Path $installDir 'Hexpad.exe'
 Copy-Item $src $exe -Force
-$ico = Join-Path $root 'assets\ajazzdock.ico'
-$icoInstalled = Join-Path $installDir 'ajazzdock.ico'
+$ico = Join-Path $root 'assets\hexpad.ico'
+$icoInstalled = Join-Path $installDir 'hexpad.ico'
 if (Test-Path $ico) { Copy-Item $ico $icoInstalled -Force }
 
 # Create shortcuts (Start Menu + Desktop).
@@ -27,24 +38,35 @@ function New-AppShortcut($path) {
   $lnk.TargetPath = $exe
   $lnk.WorkingDirectory = $installDir
   if (Test-Path $icoInstalled) { $lnk.IconLocation = $icoInstalled }
-  $lnk.Description = 'AjazzDock - AKP03 controller'
+  $lnk.Description = 'Hexpad - AKP03 stream dock controller'
   $lnk.Save()
 }
-$startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AjazzDock.lnk'
-$desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'AjazzDock.lnk'
+$startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Hexpad.lnk'
+$desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Hexpad.lnk'
 New-AppShortcut $startMenu
 New-AppShortcut $desktop
 
-# Point autostart at the installed exe.
-$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-Set-ItemProperty -Path $runKey -Name 'AjazzDock' -Value ('"{0}" --tray' -f $exe) -Force
+# Autostart: an elevated Scheduled Task at logon (an HKCU Run entry can't auto-elevate).
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Hexpad' -ErrorAction SilentlyContinue
+schtasks /create /tn 'Hexpad' /tr ('"{0}" --tray' -f $exe) /sc onlogon /rl highest /f | Out-Null
+
+# ---- retire the old "AjazzDock" install (rebrand cleanup; the %APPDATA%\AjazzDock config STAYS) ----
+schtasks /delete /tn 'AjazzDock' /f 2>$null | Out-Null
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'AjazzDock' -ErrorAction SilentlyContinue
+$oldStart = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AjazzDock.lnk'
+$oldDesk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'AjazzDock.lnk'
+Remove-Item $oldStart, $oldDesk -Force -ErrorAction SilentlyContinue
+$oldDir = Join-Path $env:LOCALAPPDATA 'AjazzDock'
+Remove-Item $oldDir -Recurse -Force -ErrorAction SilentlyContinue   # only the old exe folder; config is in %APPDATA%
 
 Write-Host ""
 Write-Host "Installed:        $exe" -ForegroundColor Green
 Write-Host "Start Menu:       $startMenu"
 Write-Host "Desktop shortcut: $desktop"
-Write-Host "Autostart ->      $exe"
+Write-Host "Autostart:        Scheduled Task 'Hexpad' (elevated, at logon)"
+Write-Host "Old AjazzDock install/shortcuts/task removed; your settings in %APPDATA%\AjazzDock kept."
 
-# Launch the installed app.
+# Launch the installed app (already elevated -> no second UAC prompt).
 Start-Process -FilePath $exe
-Write-Host "Launched AjazzDock from the installed location." -ForegroundColor Green
+Write-Host "Launched Hexpad from the installed location." -ForegroundColor Green
+Start-Sleep -Milliseconds 1500

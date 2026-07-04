@@ -189,7 +189,7 @@ function renderEditor(){
     const img=el("img"); preview(img,it);
     const lab=el("input",{value:it.label||"",placeholder:"Label",oninput:e=>{it.label=e.target.value;refreshSlot(img,it);}});
     const icon=el("input",{value:it.icon||"",placeholder:"emoji or image path",oninput:e=>{it.icon=e.target.value;refreshSlot(img,it);}});
-    const color=el("input",{type:"color",value:it.color||"#23272e",oninput:e=>{it.color=e.target.value;refreshSlot(img,it);}});
+    const color=el("input",{type:"color",value:it.color||"#000000",oninput:e=>{it.color=e.target.value;refreshSlot(img,it);}});
     const tcol=el("input",{type:"color",value:it.text_color||"#ffffff",oninput:e=>{it.text_color=e.target.value;refreshSlot(img,it);}});
     const palette=el("div",{class:"emoji-pick"});EMOJIS.forEach(em=>palette.append(el("span",{onclick:()=>{it.icon=em;icon.value=em;refreshSlot(img,it);}},em)));
     wrap.append(el("div",{class:"preview"},img,el("div",{},field("Label",lab),field("Icon",icon))));

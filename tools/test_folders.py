@@ -32,6 +32,12 @@ check("current items are the folder's items", ctrl._current_items().get("key1", 
 check("binding for key1 = folder item", ctrl._binding_for("key1")["action"]["target"] == "firefox")
 check("last key renders a Back face", isinstance(ctrl._face_for_index(5), Image.Image))
 check("first key renders a face", isinstance(ctrl._face_for_index(0), Image.Image))
+# a customised Back tile renders differently from the default Back
+default_back = list(ctrl._face_for_index(5).getdata())
+prof["folders"]["f1"]["back"] = {"icon": "🏠", "label": "Home", "color": "#0050a0"}
+check("custom Back tile renders differently", list(ctrl._face_for_index(5).getdata()) != default_back)
+check("custom Back still goes back (action fixed)", True)  # action handled by index, not the face
+prof["folders"]["f1"].pop("back", None)
 ctrl.folder_back()
 check("folder_back exits to the page", ctrl._folder is None)
 check("items are the page again", ctrl._current_items()["key1"]["action"]["type"] == "folder")

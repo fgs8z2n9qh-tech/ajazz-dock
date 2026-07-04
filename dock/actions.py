@@ -8,7 +8,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-import keyboard  # SendInput-based; sending keys does not require admin
+# `keyboard` (SendInput-based; no admin needed) is imported lazily inside the few functions that
+# emit keys — it's only needed when an action fires, so it stays out of the startup import chain.
 
 # ---- name maps -------------------------------------------------------------
 _HOTKEY_ALIASES = {
@@ -22,6 +23,35 @@ _MEDIA_KEYS = {
     "previous": "previous track", "stop": "stop media",
 }
 _VOLUME_KEYS = {"up": "volume up", "down": "volume down", "mute": "volume mute"}
+
+# Calm brand accent for non-volume HUDs (brightness / RGB / bulb); volume HUDs use the heat ramp.
+_HUD_MINT = "#35e08a"
+
+
+def _system_volume():
+    """(percent 0..100, muted) of the default output device, or None if it can't be read.
+
+    Uses the MMDevice enumerator directly: newer pycaw's `GetSpeakers()` returns a wrapped
+    AudioDevice with no `.Activate()`, so we grab the raw default render endpoint (eRender=0,
+    eConsole=0) — the same device the volume keys control — exactly like _Mic's fallback."""
+    try:
+        import comtypes
+        from ctypes import POINTER, cast
+        from comtypes import CLSCTX_ALL, CoCreateInstance
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+        from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+        from pycaw.pycaw import IAudioEndpointVolume
+        try:
+            comtypes.CoInitialize()
+        except OSError:
+            pass
+        enum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
+        dev = enum.GetDefaultAudioEndpoint(0, 0)          # eRender, eConsole = the default speakers
+        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        ep = cast(iface, POINTER(IAudioEndpointVolume))
+        return int(round(ep.GetMasterVolumeLevelScalar() * 100)), bool(ep.GetMute())
+    except Exception:
+        return None
 
 # "Quick actions": common Windows tasks as one-press presets. Most are really just a
 # standard system shortcut; the rest (recycle bin, clipboard, settings) need a real call.
@@ -37,6 +67,249 @@ _QUICK_HOTKEYS = {
 def _normalize_hotkey(spec: str) -> str:
     parts = [p.strip().lower() for p in spec.replace(" ", "").split("+") if p.strip()]
     return "+".join(_HOTKEY_ALIASES.get(p, p) for p in parts)
+
+
+# ---- integrations: Tapo bulb (direct, via python-kasa) + Prisma (RGB) -----
+# The bulb is driven DIRECTLY over the LAN (no Lumos app needed); Prisma over its
+# Stream-Deck-style CLI (a launch with args forwards to the running instance).
+_TAPO_DEFAULT_HOST = "192.168.0.87"          # the user's Tapo L630
+_RGB_EXE = r"C:\Users\Erik\Desktop\project\RGBCommander\dist\RGBCommander.exe"
+_RGB_PROC_NAMES = ("Prisma.exe", "RGBCommander.exe")   # the RGB app (renamed Prisma; old name kept)
+
+
+def _hex_to_hsv(hexcol: str):
+    """'#RRGGBB' -> (hue 0-360, sat 0-100, val 0-100)."""
+    import colorsys
+    c = (hexcol or "").lstrip("#")
+    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    return round(h * 360), round(s * 100), round(v * 100)
+
+
+def _proc_running(name) -> bool:
+    try:
+        import psutil
+    except Exception:
+        return True                          # can't check -> assume up (avoid double-launch)
+    names = {name.lower()} if isinstance(name, str) else {n.lower() for n in name}
+    for p in psutil.process_iter(["name"]):
+        try:
+            if (p.info.get("name") or "").lower() in names:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+class _DiscordVol:
+    """Coalesces encoder ticks for Discord mic/output volume: one worker accumulates the signed
+    delta and applies it via the RPC pipe per rate-limit window, so a fast spin doesn't flood it."""
+
+    def __init__(self, controller=None):
+        self.controller = controller
+        self._d_in = 0
+        self._d_out = 0
+        self._lock = threading.Lock()
+        self._ev = threading.Event()
+        self._thread = None
+
+    def nudge(self, which: str, delta: int) -> None:
+        with self._lock:
+            if which == "in":
+                self._d_in += int(delta)
+            else:
+                self._d_out += int(delta)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="discord-vol", daemon=True)
+                self._thread.start()
+        self._ev.set()
+
+    def _run(self) -> None:
+        from . import discord as dc, live
+        while True:
+            self._ev.wait()
+            self._ev.clear()
+            with self._lock:
+                di, self._d_in = self._d_in, 0
+                do, self._d_out = self._d_out, 0
+            if di == 0 and do == 0:
+                continue
+            try:
+                hud = None
+                if di:
+                    nv = dc.nudge_input(di)
+                    live.set_discord_volume(inp=nv)
+                    hud = (nv, "Discord (mic)", 100)         # Discord input volume is 0..100
+                if do:
+                    nv = dc.nudge_output(do)
+                    live.set_discord_volume(out=nv)
+                    hud = (nv, "Discord", 200)               # output (others' volume) is 0..200
+                if self.controller is not None:
+                    if hud and hasattr(self.controller, "show_value_hud"):
+                        self.controller.show_value_hud(hud[0], hud[1], vmax=hud[2])
+                    if hasattr(self.controller, "refresh_live"):
+                        self.controller.refresh_live()
+            except getattr(dc, "NeedsAuth", Exception):
+                pass
+            except Exception as e:
+                print(f"[discord-vol] {e}")
+            time.sleep(0.09)          # rate-limit; coalesce ticks landing during this window
+
+
+class _ObsVolume:
+    """Coalesces encoder ticks for an OBS input's volume (0..1 multiplier): one worker applies a
+    single SetInputVolume per rate-limit window and pushes the on-screen HUD. Push = mute toggle."""
+
+    def __init__(self, controller=None):
+        self.controller = controller
+        self._lock = threading.Lock()
+        self._ev = threading.Event()
+        self._pending: Dict[str, int] = {}     # input -> accumulated step (percent points)
+        self._mul: Dict[str, float] = {}       # input -> last-known volume mul
+        self._muted: Dict[str, bool] = {}      # input -> last-known mute state
+        self._thread = None
+
+    def _hud(self, inp):
+        if self.controller is not None and hasattr(self.controller, "show_volume_hud"):
+            pct = int(round(max(0.0, min(1.0, self._mul.get(inp, 0.0))) * 100))
+            self.controller.show_volume_hud(pct, bool(self._muted.get(inp)), inp)
+
+    def nudge(self, inp: str, delta_pct: int) -> None:
+        with self._lock:
+            self._pending[inp] = self._pending.get(inp, 0) + int(delta_pct)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="obs-vol", daemon=True)
+                self._thread.start()
+        self._ev.set()
+
+    def mute(self, inp: str) -> None:
+        def work():
+            try:
+                from . import obs
+                self._muted[inp] = obs.toggle_input_mute(inp)
+                if inp not in self._mul:
+                    m = obs.input_volume_mul(inp)
+                    if m is not None:
+                        self._mul[inp] = m
+                self._hud(inp)
+            except Exception as e:
+                print(f"[obs-vol] {e}")
+        threading.Thread(target=work, name="obs-mute", daemon=True).start()
+
+    def _run(self) -> None:
+        from . import obs
+        while True:
+            self._ev.wait()
+            self._ev.clear()
+            with self._lock:
+                pend, self._pending = self._pending, {}
+            pend = {k: v for k, v in pend.items() if v}
+            if not pend:
+                continue
+            try:
+                for inp, dp in pend.items():
+                    cur = self._mul.get(inp)
+                    if cur is None:
+                        cur = obs.input_volume_mul(inp)
+                        cur = 1.0 if cur is None else cur
+                        self._muted[inp] = obs.input_muted(inp)
+                    nv = max(0.0, min(1.0, cur + dp / 100.0))
+                    self._mul[inp] = nv
+                    obs.set_input_volume_mul(inp, nv)
+                    self._hud(inp)
+            except Exception as e:
+                print(f"[obs-vol] {e}")
+            time.sleep(0.09)          # rate-limit; coalesce ticks landing during this window
+
+
+class _RgbDimmer:
+    """Coalesces encoder brightness ticks for Prisma: one worker thread accumulates the signed delta
+    and fires a single `--brightness +N` per rate-limit window (Prisma resolves +/- against its own
+    brightness bar), so a fast spin never launches a process per click."""
+
+    def __init__(self):
+        self._delta = 0
+        self._exe = _RGB_EXE
+        self._lock = threading.Lock()
+        self._ev = threading.Event()
+        self._thread = None
+
+    def nudge(self, exe: str, delta: int) -> None:
+        with self._lock:                          # restart inside the lock (no TOCTOU on _thread)
+            self._delta += int(delta)
+            self._exe = exe or self._exe
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="rgb-dimmer", daemon=True)
+                self._thread.start()
+        self._ev.set()
+
+    def _run(self) -> None:
+        while True:
+            self._ev.wait()
+            self._ev.clear()
+            with self._lock:
+                d, self._delta = self._delta, 0
+                exe = self._exe
+            if d == 0:
+                continue
+            try:
+                if not _proc_running(_RGB_PROC_NAMES):
+                    subprocess.Popen([exe, "--minimized"])
+                    time.sleep(1.8)
+                sign = "+" if d > 0 else "-"
+                subprocess.Popen([exe, "--brightness", f"{sign}{abs(d)}"])
+            except Exception as e:
+                print(f"[rgbscene] {e}")
+            time.sleep(0.12)          # rate-limit; coalesce ticks landing during this window
+
+
+def _hsv_to_hex(h, s=100, v=100):
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb((h % 360) / 360.0, s / 100.0, v / 100.0)
+    return f"{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}"
+
+
+class _RgbHue:
+    """Coalesces encoder colour-cycle ticks for Prisma: accumulate a signed hue delta and fire ONE
+    `--effect static --color <hex>` per rate-limit window (we own a local hue since Prisma can't
+    report its colour), so spinning the dial scrolls colours without a process launch per click."""
+
+    def __init__(self):
+        self._delta = 0
+        self._hue = 0.0
+        self._exe = _RGB_EXE
+        self._lock = threading.Lock()
+        self._ev = threading.Event()
+        self._thread = None
+
+    def nudge(self, exe: str, delta: int) -> None:
+        with self._lock:
+            self._delta += int(delta)
+            self._exe = exe or self._exe
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="rgb-hue", daemon=True)
+                self._thread.start()
+        self._ev.set()
+
+    def _run(self) -> None:
+        while True:
+            self._ev.wait()
+            self._ev.clear()
+            with self._lock:
+                d, self._delta = self._delta, 0
+                exe = self._exe
+            if d == 0:
+                continue
+            self._hue = (self._hue + d) % 360
+            hexc = _hsv_to_hex(self._hue)
+            try:
+                if not _proc_running(_RGB_PROC_NAMES):
+                    subprocess.Popen([exe, "--minimized"])
+                    time.sleep(1.8)
+                subprocess.Popen([exe, "--effect", "static", "--color", hexc])
+            except Exception as e:
+                print(f"[rgbscene] {e}")
+            time.sleep(0.12)          # rate-limit; coalesce ticks landing during this window
 
 
 # ---- layout-independent scan-code sending ----------------------------------
@@ -87,6 +360,25 @@ def _scan_event(code: int, down: bool) -> None:
     ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
+# All key/scan-code emission is serialised through one re-entrant lock: a macro runs on the
+# device-loop thread while plain hotkey/text actions run on the off-loop worker, and both drive the
+# global `keyboard` module (shared modifier state) — without this their down/up events can interleave
+# and leak a held modifier (e.g. Ctrl stuck down).
+_KBD_LOCK = threading.RLock()
+
+
+def _kb_send(spec) -> None:
+    import keyboard
+    with _KBD_LOCK:
+        keyboard.send(spec)
+
+
+def _kb_write(text, **kw) -> None:
+    import keyboard
+    with _KBD_LOCK:
+        keyboard.write(text, **kw)
+
+
 def send_scancode_combo(spec: str) -> bool:
     """Press a hotkey by physical scan code. False (no-op) if any token is unmapped."""
     parts = [_HOTKEY_ALIASES.get(p.strip().lower(), p.strip().lower())
@@ -102,15 +394,16 @@ def send_scancode_combo(spec: str) -> bool:
         keys.append(sc)
     if not keys:
         return False
-    for sc in mods:
-        _scan_event(sc, True)
-    for sc in keys:
-        _scan_event(sc, True)
-    time.sleep(0.012)
-    for sc in reversed(keys):
-        _scan_event(sc, False)
-    for sc in reversed(mods):
-        _scan_event(sc, False)
+    with _KBD_LOCK:                        # whole press→release sequence is one critical section
+        for sc in mods:
+            _scan_event(sc, True)
+        for sc in keys:
+            _scan_event(sc, True)
+        time.sleep(0.012)
+        for sc in reversed(keys):
+            _scan_event(sc, False)
+        for sc in reversed(mods):
+            _scan_event(sc, False)
     return True
 
 
@@ -168,6 +461,63 @@ class _Mic:
             return None
 
 
+class _AppVolume:
+    """Per-application volume via pycaw audio sessions. Target = the focused app, or an exe name."""
+
+    def _sessions(self, target):
+        from pycaw.pycaw import AudioUtilities
+        import comtypes
+        try:
+            comtypes.CoInitialize()
+        except OSError:
+            pass
+        pid = None
+        name = target
+        if target in ("", "focused", None):
+            from .apppoller import foreground_pid, proc_name
+            pid = foreground_pid()
+            name = proc_name(pid)
+        out = []
+        for s in AudioUtilities.GetAllSessions():
+            p = s.Process
+            if p is None:
+                continue
+            try:
+                if pid is not None:
+                    if p.pid == pid:
+                        out.append(s)
+                elif (p.name() or "").lower() == (target or "").lower():
+                    out.append(s)
+                    name = p.name()
+            except Exception:
+                pass
+        return out, (name or "Volume")
+
+    def apply(self, target, mode, step):
+        """Returns (volume_percent, muted, app_name) for the HUD, or None if nothing to control."""
+        sess, name = self._sessions(target)
+        if not sess:
+            return None
+        vols = []
+        for s in sess:
+            v = s.SimpleAudioVolume
+            if mode == "mute":
+                v.SetMute(0 if v.GetMute() else 1, None)
+            else:
+                cur = v.GetMasterVolume()
+                nv = max(0.0, min(1.0, cur + (step / 100.0 if mode == "up" else -step / 100.0)))
+                v.SetMasterVolume(nv, None)
+                if nv > 0:
+                    v.SetMute(0, None)                 # nudging volume unmutes
+            vols.append(s.SimpleAudioVolume.GetMasterVolume())
+        muted = bool(sess[0].SimpleAudioVolume.GetMute())
+        pct = int(round((sum(vols) / len(vols)) * 100))
+        return (pct, muted, name)
+
+
+_MON_FADE_MIN = 7      # batched nudge >= this many % fades smoothly; smaller stays instant
+
+
 class _MonitorDimmer:
     """Coalesces monitor-brightness changes so a fast-spun encoder stays smooth.
 
@@ -175,12 +525,22 @@ class _MonitorDimmer:
     accumulate the deltas and apply the batched total in a background worker.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, controller=None) -> None:
+        self.controller = controller
         self._lock = threading.Lock()
         self._pending: Dict[Any, int] = {}     # key -> accumulated delta
         self._target: Dict[Any, int] = {}      # key -> set-target percent
+        self._cur: Dict[Any, float] = {}       # key -> locally-owned set-point % (seeded from DDC once/burst)
         self._wake = threading.Event()
         self._thread = None
+
+    def _hud(self, idx, pct):
+        c = self.controller
+        if pct is not None and c is not None and hasattr(c, "show_value_hud"):
+            try:
+                c.show_value_hud(int(pct), "Monitor", accent=_HUD_MINT)
+            except Exception:
+                pass
 
     @staticmethod
     def _key(index):
@@ -191,13 +551,19 @@ class _MonitorDimmer:
         with self._lock:
             self._pending[k] = self._pending.get(k, 0) + delta
             self._target.pop(k, None)
+            cur = self._cur.get(k)
+            proj = None if cur is None else max(0, min(100, cur + self._pending[k]))
+        if proj is not None:                       # optimistic — the HUD tracks the knob instantly
+            self._hud(None if k == "all" else k, int(round(proj)))
         self._kick()
 
     def set(self, value, index) -> None:
         k = self._key(index)
+        v = max(0, min(100, int(value)))
         with self._lock:
-            self._target[k] = value
+            self._target[k] = v
             self._pending.pop(k, None)
+        self._hud(None if k == "all" else k, v)    # optimistic
         self._kick()
 
     def _kick(self) -> None:
@@ -209,22 +575,55 @@ class _MonitorDimmer:
 
     def _run(self) -> None:
         from . import monitors
-        while True:
-            if not self._wake.wait(timeout=3.0):
-                return
-            self._wake.clear()
-            with self._lock:
-                pend, self._pending = self._pending, {}
-                targ, self._target = self._target, {}
-            for k, delta in pend.items():
-                if delta:
+        sessions: Dict[Any, Any] = {}              # key -> BrightnessSession (handles+range cached for the burst)
+
+        def _sess(k, idx):
+            s = sessions.get(k)
+            if s is None:
+                s = monitors.BrightnessSession(idx)
+                sessions[k] = s
+                cp = s.current_pct()               # re-sync to the monitor's true % at burst start
+                if cp is not None:
+                    with self._lock:
+                        self._cur[k] = float(cp)
+            return s
+
+        try:
+            while True:
+                if not self._wake.wait(timeout=2.5):
+                    return                          # idle -> exit (finally closes the DDC handles)
+                self._wake.clear()
+                with self._lock:
+                    pend, self._pending = self._pending, {}
+                    targ, self._target = self._target, {}
+                for k, delta in pend.items():
+                    if not delta:
+                        continue
+                    idx = None if k == "all" else k
                     try:
-                        monitors.adjust_brightness(delta, None if k == "all" else k)
+                        s = _sess(k, idx)
+                        with self._lock:
+                            cur = max(0.0, min(100.0, self._cur.get(k, 50.0) + delta))
+                            self._cur[k] = cur
+                        s.set_pct(cur)              # ONE DDC SET (no enum / no read-back) — snappy
+                        self._hud(idx, int(round(cur)))
                     except Exception:
                         pass
-            for k, val in targ.items():
+                for k, val in targ.items():
+                    idx = None if k == "all" else k
+                    try:
+                        s = _sess(k, idx)
+                        with self._lock:
+                            self._cur[k] = float(val)
+                        s.set_pct(float(val))
+                        self._hud(idx, int(round(val)))
+                    except Exception:
+                        pass
+                time.sleep(0.025)                   # coalesce ticks landing during the DDC write
+        finally:
+            for s in sessions.values():
                 try:
-                    monitors.set_brightness(val, None if k == "all" else k)
+                    s.close()
                 except Exception:
                     pass
 
@@ -234,14 +633,50 @@ class ActionEngine:
         self.controller = controller
         self.mic = _Mic()
         self._mon_dimmer = None
+        self._app_vol = None
+        self._rgb_dimmer = None
+        self._discord_vol = None
+        self._obs_vol = None
+        self._rgb_est = None             # local brightness estimate for Prisma (can't be read back)
+        self._rgb_hue = None             # encoder colour-cycle coalescer for Prisma
+        self._rgb_hue_est = None         # local hue estimate (Prisma can't report colour) for the HUD
+        self._tapo_notify_set = False    # registered the bulb bri/hue HUD callback yet?
+        self._work_q = None              # lazily-created queue for the off-loop action worker
+
+    # Actions that touch controller navigation state, or hold a thread-bound COM object, or already
+    # self-thread, run INLINE (on the device loop thread). Everything else — blocking keyboard /
+    # system side-effects — runs on a single ordered worker thread so the input loop never waits on
+    # a keystroke simulation (keeps presses/turns snappy). mic/monitor stay inline (COM is bound to
+    # the thread that created it); macro stays inline (it may contain navigation sub-steps).
+    _INLINE = frozenset({"open", "page", "folder", "profile", "brightness", "sound",
+                         "smartlight", "appvolume", "rgbscene", "obs", "mic", "monitor", "macro"})
 
     def execute(self, action: Optional[Dict[str, Any]]) -> None:
         if not action:
             return
-        try:
-            self._dispatch(action)
-        except Exception as e:  # never let a bad binding kill the event loop
-            print(f"[action] error running {action!r}: {e}")
+        t = (action.get("type") or "").lower()
+        if t in self._INLINE:
+            try:
+                self._dispatch(action)
+            except Exception as e:  # never let a bad binding kill the event loop
+                print(f"[action] error running {action!r}: {e}")
+        else:
+            self._enqueue(action)   # blocking keyboard/system action -> off the input loop
+
+    def _enqueue(self, action: Dict[str, Any]) -> None:
+        if self._work_q is None:
+            import queue
+            self._work_q = queue.Queue()
+            threading.Thread(target=self._work_loop, name="action-worker", daemon=True).start()
+        self._work_q.put(action)
+
+    def _work_loop(self) -> None:
+        while True:
+            action = self._work_q.get()
+            try:
+                self._dispatch(action)
+            except Exception as e:
+                print(f"[action] error running {action!r}: {e}")
 
     # ------------------------------------------------------------------
     def _dispatch(self, action: Dict[str, Any]) -> None:
@@ -253,19 +688,20 @@ class ActionEngine:
             if "mouse:" in keys:
                 self._send_mouse(keys)
             else:
-                keyboard.send(_normalize_hotkey(keys))
+                _kb_send(_normalize_hotkey(keys))
         elif t == "text":
-            keyboard.write(action.get("text", ""), delay=0.005)
+            _kb_write(action.get("text", ""), delay=0.005)
         elif t == "media":
             key = _MEDIA_KEYS.get((action.get("media") or "").lower())
             if key:
-                keyboard.send(key)
+                _kb_send(key)
         elif t == "volume":
             key = _VOLUME_KEYS.get((action.get("volume") or "").lower())
             if key:
                 repeat = max(1, int(action.get("step", 1)))
                 for _ in range(repeat):
-                    keyboard.send(key)
+                    _kb_send(key)
+                self._system_volume_hud()        # read the settled level -> bar HUD on the keys
         elif t == "mic":
             mode = (action.get("mic") or "toggle").lower()
             if mode == "toggle":
@@ -289,18 +725,22 @@ class ActionEngine:
                 self._call("adjust_brightness", int(action["delta"]))
             else:
                 self._call("set_brightness", int(action.get("value", 70)))
+            cfg = getattr(self.controller, "config", None)          # _call is sync -> value is current
+            if cfg is not None:
+                self._hud(max(0, min(100, int(cfg.brightness))), "Key brightness", accent=_HUD_MINT)
         elif t == "system":
             self._system((action.get("system") or "lock").lower())
         elif t == "monitor":
             self._monitor(action)
         elif t == "sound":
             from . import sound
-            sound.play(action.get("file", ""), action.get("device") or None,
-                       bool(action.get("monitor", False)), float(action.get("gain", 1.0) or 1.0))
+            if (action.get("mode") or "play").lower() == "stop":
+                sound.stop()                            # cut all currently-playing clips
+            else:
+                sound.play(action.get("file", ""), action.get("device") or None,
+                           bool(action.get("monitor", False)), float(action.get("gain", 1.0) or 1.0))
         elif t == "discord":
-            keys = action.get("keys")
-            if keys:
-                keyboard.send(_normalize_hotkey(keys))   # mirror this key in Discord > Keybinds
+            self._discord(action)
         elif t == "substance":
             keys = action.get("keys", "")
             if "mouse:" in keys:
@@ -309,7 +749,9 @@ class ActionEngine:
                 # Send by physical scan code so Painter shortcuts ([ ] brush size, digits, …)
                 # fire on any keyboard layout; fall back to character send if unmapped.
                 if not send_scancode_combo(keys):
-                    keyboard.send(_normalize_hotkey(keys))
+                    _kb_send(_normalize_hotkey(keys))
+        elif t == "http":
+            self._http(action)
         elif t == "quick":
             self._quick(action.get("op"))
         elif t == "macro":
@@ -318,10 +760,49 @@ class ActionEngine:
                     time.sleep(max(0, int(step.get("ms", 0))) / 1000.0)
                 else:
                     self._dispatch(step)
+        elif t == "smartlight":
+            self._smartlight(action)
+        elif t == "rgbscene":
+            self._rgbscene(action)
+        elif t == "appvolume":
+            self._appvolume(action)
+        elif t == "obs":
+            self._obs(action)
+        elif t == "toggle":
+            # Per-key toggling (state + face) lives in the controller; here (encoder/macro use) we
+            # just fire the first non-empty state's action so it still does something sensible.
+            for st in (action.get("states") or []):
+                sub = st.get("action") if isinstance(st, dict) else None
+                if sub and (sub.get("type") or "none") not in ("none", "", None):
+                    self._dispatch(sub)
+                    break
         elif t in ("none", "", None):
             pass
         else:
             print(f"[action] unknown action type: {t!r}")
+
+    def _http(self, action: Dict[str, Any]) -> None:
+        """Fire a user-configured HTTP request (webhook / REST API) — runs on the off-loop worker
+        so a slow endpoint never stalls the dock. GET/POST/PUT/PATCH/DELETE; an optional body is
+        sent for the write verbs, with a Content-Type (default application/json)."""
+        import urllib.request
+        url = (action.get("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return                                      # only real HTTP(S) endpoints
+        method = (action.get("method") or "GET").upper()
+        if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+            method = "GET"
+        body = action.get("body") or ""
+        data = body.encode("utf-8") if (body and method in ("POST", "PUT", "PATCH", "DELETE")) else None
+        headers = {"User-Agent": "AjazzDock"}
+        if data:
+            headers["Content-Type"] = (action.get("content_type") or "application/json").strip()
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp.read(64)                           # complete the exchange; body is discarded
+        except Exception as e:
+            print(f"[action] http {method} {url!r} failed: {e}")
 
     def _quick(self, op: Optional[str]) -> None:
         op = (op or "").lower()
@@ -336,7 +817,7 @@ class ActionEngine:
         elif op == "lock":
             self._system("lock")
         elif op in _QUICK_HOTKEYS:
-            keyboard.send(_QUICK_HOTKEYS[op])
+            _kb_send(_QUICK_HOTKEYS[op])
         else:
             print(f"[action] unknown quick action: {op!r}")
 
@@ -372,41 +853,74 @@ class ActionEngine:
 
     def _send_mouse(self, spec: str) -> None:
         """Send a mouse action (optionally with held modifiers), e.g. 'ctrl+mouse:wheel_up'."""
+        import keyboard
         import mouse
         parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
         mtoken = next((p for p in parts if p.startswith("mouse:")), "")
         mods = [_HOTKEY_ALIASES.get(p, p) for p in parts if not p.startswith("mouse:")]
-        held = []
-        for m in mods:
-            try:
-                keyboard.press(m)
-                held.append(m)
-            except Exception:
-                pass
-        try:
-            act = mtoken.split(":", 1)[1] if ":" in mtoken else ""
-            if act == "left":
-                mouse.click("left")
-            elif act == "right":
-                mouse.click("right")
-            elif act == "middle":
-                mouse.click("middle")
-            elif act == "double":
-                mouse.double_click("left")
-            elif act == "back":
-                mouse.click("x")
-            elif act == "forward":
-                mouse.click("x2")
-            elif act == "wheel_up":
-                mouse.wheel(1)
-            elif act == "wheel_down":
-                mouse.wheel(-1)
-        finally:
-            for m in reversed(held):
+        with _KBD_LOCK:                    # hold the lock across press → click → release as one unit
+            held = []
+            for m in mods:
                 try:
-                    keyboard.release(m)
+                    keyboard.press(m)
+                    held.append(m)
                 except Exception:
                     pass
+            try:
+                act = mtoken.split(":", 1)[1] if ":" in mtoken else ""
+                if act == "left":
+                    mouse.click("left")
+                elif act == "right":
+                    mouse.click("right")
+                elif act == "middle":
+                    mouse.click("middle")
+                elif act == "double":
+                    mouse.double_click("left")
+                elif act == "back":
+                    mouse.click("x")
+                elif act == "forward":
+                    mouse.click("x2")
+                elif act == "wheel_up":
+                    mouse.wheel(1)
+                elif act == "wheel_down":
+                    mouse.wheel(-1)
+            finally:
+                for m in reversed(held):
+                    try:
+                        keyboard.release(m)
+                    except Exception:
+                        pass
+
+    def _hud(self, value, name, *, muted=False, accent=None, relative=0, unit="%", vmax=100):
+        c = self.controller
+        if c is not None and hasattr(c, "show_value_hud"):
+            try:
+                c.show_value_hud(value, name, muted=muted, accent=accent, relative=relative,
+                                 unit=unit, vmax=vmax)
+            except Exception:
+                pass
+
+    def _system_volume_hud(self):
+        """Read the (just-changed) system output level off-thread and pop a bar HUD."""
+        if self.controller is None or not hasattr(self.controller, "show_value_hud"):
+            return
+        def work():
+            time.sleep(0.05)                      # let the media key settle
+            r = _system_volume()
+            if r is not None:
+                pct, muted = r
+                self._hud(pct, "Volume", muted=muted)
+        threading.Thread(target=work, name="sysvol-hud", daemon=True).start()
+
+    def _bulb_hud(self, kind, value):
+        """tapo callback (its bg loop): show the bulb's true brightness % / colour hue°."""
+        if kind == "hue":
+            import colorsys
+            r, g, b = colorsys.hsv_to_rgb((int(value) % 360) / 360.0, 1.0, 1.0)
+            self._hud(int(value), "Bulb colour", unit="°", vmax=360,
+                      accent=(int(r * 255), int(g * 255), int(b * 255)))
+        else:
+            self._hud(int(value), "Bulb", accent=_HUD_MINT)
 
     def _monitor(self, action: Dict[str, Any]) -> None:
         mode = (action.get("monitor") or "up").lower()
@@ -420,13 +934,14 @@ class ActionEngine:
                 idx = None
         step = max(1, int(action.get("step", 5)))
         if self._mon_dimmer is None:
-            self._mon_dimmer = _MonitorDimmer()
+            self._mon_dimmer = _MonitorDimmer(self.controller)
         if mode == "set":
             self._mon_dimmer.set(int(action.get("value", 50)), idx)
         elif mode == "down":
             self._mon_dimmer.bump(-step, idx)
         else:
             self._mon_dimmer.bump(step, idx)
+        # the dimmer thread reads the true brightness after applying and pops the HUD itself
 
     # ------------------------------------------------------------------
     def _open(self, action: Dict[str, Any]) -> None:
@@ -448,6 +963,255 @@ class ActionEngine:
             self._call("prev_page")
         elif where in ("goto", "set"):
             self._call("goto_page", int(action.get("target", 0)))
+
+    # ---- integrations ---------------------------------------------------------
+    # encoder relative modes -> (kind, sign, default-step)
+    _REL_LIGHT = {"brightness_up": ("bri", 1, 10), "brightness_down": ("bri", -1, 10),
+                  "hue_up": ("hue", 1, 18), "hue_down": ("hue", -1, 18)}   # finer = smoother colour cycle
+
+    def _smartlight(self, action: Dict[str, Any]) -> None:
+        """Control the Tapo bulb directly (on/off/toggle/colour/relative) — no Lumos app required."""
+        host = (action.get("host") or _TAPO_DEFAULT_HOST).strip()
+        mode = (action.get("mode") or "toggle").lower()
+        color = action.get("color")
+        brightness = action.get("brightness")
+        config = getattr(self.controller, "config", None) if self.controller else None
+
+        # Encoder turn: accumulate the change locally and let tapo coalesce/rate-limit the flush,
+        # so spinning fast feels instant. nudge() never blocks, so no worker thread is needed.
+        rel = self._REL_LIGHT.get(mode)
+        if rel:
+            kind, sign, default_step = rel
+            step = int(action.get("step") or default_step)
+            try:
+                from . import tapo, live
+                email, pw = tapo.tapo_creds(config) if config is not None else (None, None)
+                if not (email and pw):
+                    print("[smartlight] no Tapo credentials — set them in the key editor")
+                    return
+                if not self._tapo_notify_set:           # surface the bulb's true bri/hue on the HUD
+                    tapo.set_live_notify(self._bulb_hud)
+                    self._tapo_notify_set = True
+                tapo.nudge(host, email, pw, kind, sign * step)
+                live.set_light_state(True)              # a brightness/colour change implies it's on
+                if self.controller is not None and hasattr(self.controller, "refresh_live"):
+                    self.controller.refresh_live()
+            except Exception as e:
+                print(f"[smartlight] {e}")
+            return
+
+        # Auto rainbow cycle: one press starts a software hue-loop, the next press stops it.
+        if mode == "cycle":
+            def work_cycle() -> None:
+                try:
+                    from . import tapo, live
+                    email, pw = tapo.tapo_creds(config) if config is not None else (None, None)
+                    if not (email and pw):
+                        print("[smartlight] no Tapo credentials — set them in the key editor")
+                        return
+                    tapo.cycle(host, email, pw, step=int(action.get("step") or 8))
+                    live.set_light_state(True)          # cycling implies the bulb is on
+                    if self.controller is not None and hasattr(self.controller, "refresh_live"):
+                        self.controller.refresh_live()
+                except Exception as e:
+                    print(f"[smartlight] {e}")
+            threading.Thread(target=work_cycle, daemon=True).start()
+            return
+
+        def work() -> None:
+            try:
+                from . import tapo
+                email, pw = tapo.tapo_creds(config) if config is not None else (None, None)
+                if not (email and pw):
+                    print("[smartlight] no Tapo credentials — set them in the key editor")
+                    return
+                hsv = None
+                if mode == "color" and color:
+                    h, s, _v = _hex_to_hsv(color)
+                    v = int(brightness) if brightness else _v
+                    hsv = (h, s, max(1, min(100, v)))
+                step = action.get("step")
+                new_on = tapo.apply(host, email, pw, mode, hsv=hsv, brightness=brightness, step=step)
+                if new_on is not None:                  # update the live key instantly, no poll wait
+                    from . import live
+                    live.set_light_state(new_on)
+                    if self.controller is not None and hasattr(self.controller, "refresh_live"):
+                        self.controller.refresh_live()
+            except Exception as e:
+                print(f"[smartlight] {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _rgbscene(self, action: Dict[str, Any]) -> None:
+        """Drive Prisma via its CLI (a launch with args forwards to the running instance)."""
+        exe = (action.get("exe") or _RGB_EXE).strip()
+        mode = (action.get("mode") or "color").lower()
+
+        # Encoder brightness: coalesce ticks so a fast spin sends ONE `--brightness +N`, not one
+        # process launch per click (Prisma resolves relative +/- against its own brightness bar).
+        if mode in ("bright_up", "bright_down"):
+            step = int(action.get("step") or 10)
+            if self._rgb_dimmer is None:
+                self._rgb_dimmer = _RgbDimmer()
+            d = step if mode == "bright_up" else -step
+            self._rgb_dimmer.nudge(exe, d)
+            # Prisma can't report its level, so track a local estimate (seeded mid-scale) for the bar.
+            self._rgb_est = max(0, min(100, (self._rgb_est if self._rgb_est is not None else 50) + d))
+            self._hud(self._rgb_est, "RGB lights", accent=_HUD_MINT)
+            return
+
+        # Encoder colour cycle: coalesce ticks into one `--color` per window; HUD tracks the dial.
+        if mode in ("hue_up", "hue_down"):
+            step = int(action.get("step") or 20)
+            if self._rgb_hue is None:
+                self._rgb_hue = _RgbHue()
+            d = step if mode == "hue_up" else -step
+            self._rgb_hue.nudge(exe, d)
+            import colorsys
+            self._rgb_hue_est = ((self._rgb_hue_est if self._rgb_hue_est is not None else 0) + d) % 360
+            r, g, b = colorsys.hsv_to_rgb(self._rgb_hue_est / 360.0, 1, 1)
+            self._hud(int(self._rgb_hue_est), "RGB colour", unit="°", vmax=360,
+                      accent=(int(r * 255), int(g * 255), int(b * 255)))
+            return
+
+        args = self._rgb_args(mode, action)
+        if args is None:
+            return
+
+        def work() -> None:
+            try:
+                if not _proc_running(_RGB_PROC_NAMES):     # no primary -> start it first
+                    subprocess.Popen([exe, "--minimized"])
+                    time.sleep(1.8)
+                subprocess.Popen([exe, *args])
+            except Exception as e:
+                print(f"[rgbscene] {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _appvolume(self, action: Dict[str, Any]) -> None:
+        """Adjust the focused (or a named) app's volume; show a volume HUD on the keys."""
+        target = action.get("target") or "focused"
+        mode = (action.get("mode") or "up").lower()
+        step = max(1, int(action.get("step", 5)))
+
+        def work() -> None:
+            try:
+                if self._app_vol is None:
+                    self._app_vol = _AppVolume()
+                res = self._app_vol.apply(target, mode, step)
+                if res and self.controller and hasattr(self.controller, "show_volume_hud"):
+                    self.controller.show_volume_hud(*res)
+            except Exception as e:
+                print(f"[appvolume] {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _obs(self, action: Dict[str, Any]) -> None:
+        """Control OBS Studio over its WebSocket (scene / record / stream / virtual cam / mute /
+        audio-source volume on a dial)."""
+        mode = (action.get("mode") or "scene").lower()
+        if mode in ("vol_up", "vol_down", "vol_mute"):          # audio mixer (encoder) — coalesced + HUD
+            inp = (action.get("input") or action.get("target") or "").strip()
+            if not inp:
+                return
+            if self._obs_vol is None:
+                self._obs_vol = _ObsVolume(self.controller)
+            if mode == "vol_mute":
+                self._obs_vol.mute(inp)
+            else:
+                step = max(1, int(action.get("step", 5)))
+                self._obs_vol.nudge(inp, step if mode == "vol_up" else -step)
+            return
+        target = (action.get("target") or "").strip()
+        config = getattr(self.controller, "config", None) if self.controller else None
+
+        def work() -> None:
+            try:
+                from . import obs
+                if config is not None:
+                    o = config.data.get("obs", {})
+                    obs.configure(o.get("host"), o.get("port"), o.get("password"))
+                req = {
+                    "scene": ("SetCurrentProgramScene", {"sceneName": target}),
+                    "preview": ("SetCurrentPreviewScene", {"sceneName": target}),
+                    "record": ("ToggleRecord", None),
+                    "stream": ("ToggleStream", None),
+                    "virtualcam": ("ToggleVirtualCam", None),
+                    "replay": ("SaveReplayBuffer", None),
+                    "mute": ("ToggleInputMute", {"inputName": target}),
+                }.get(mode)
+                if req is None:
+                    return
+                obs.request(req[0], req[1])
+            except Exception as e:
+                print(f"[obs] {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _discord(self, action: Dict[str, Any]) -> None:
+        """Discord voice over RPC: mute/deafen/disconnect, mic/output volume dials, PTT/noise
+        toggles, join a channel — or a plain keybind."""
+        mode = (action.get("mode") or "").lower()
+        keys = action.get("keys")
+        if mode in ("keybind", "ptt_key") or (not mode and keys):
+            if keys:                                       # legacy / push-to-talk via a Discord keybind
+                _kb_send(_normalize_hotkey(keys))
+            return
+        mode = mode or "mute"
+
+        # Encoder volume dials: coalesce so a fast spin doesn't flood the RPC pipe (one worker).
+        if mode in ("invol_up", "invol_down", "outvol_up", "outvol_down"):
+            step = max(1, int(action.get("step", 5))) * (1 if mode.endswith("up") else -1)
+            if self._discord_vol is None:
+                self._discord_vol = _DiscordVol(self.controller)
+            self._discord_vol.nudge("in" if mode.startswith("invol") else "out", step)
+            return
+
+        channel = action.get("channel_id")
+
+        def work() -> None:
+            from . import discord as dc, live
+            try:
+                if mode == "mute":
+                    live.set_discord_state(mute=dc.toggle_mute())
+                elif mode == "deafen":
+                    live.set_discord_state(deaf=dc.toggle_deaf())
+                elif mode == "disconnect":
+                    dc.disconnect_voice()
+                elif mode == "mode_toggle":
+                    dc.toggle_mode()
+                elif mode == "noise_toggle":
+                    dc.toggle_noise()
+                elif mode == "join":
+                    dc.join_channel(channel or dc.current_channel_id())
+                else:
+                    return
+                if self.controller is not None and hasattr(self.controller, "refresh_live"):
+                    self.controller.refresh_live()
+            except dc.NeedsAuth:
+                print("[discord] not authorized yet — open the editor's “Discord app…” dialog and Authorize")
+            except Exception as e:
+                print(f"[discord] {e}")
+
+        threading.Thread(target=work, name="discord", daemon=True).start()
+
+    @staticmethod
+    def _rgb_args(mode: str, action: Dict[str, Any]) -> Optional[List[str]]:
+        if mode == "color":
+            return ["--effect", "static", "--color", (action.get("color") or "00C8AA").lstrip("#")]
+        if mode == "effect":
+            return ["--effect", (action.get("effect") or "Rainbow")]
+        if mode == "profile":
+            name = (action.get("profile") or "").strip()
+            return ["--profile", name] if name else None
+        if mode == "bright_set":
+            return ["--brightness", str(max(0, min(100, int(action.get("brightness", 100)))))]
+        if mode == "toggle":
+            return ["--toggle"]
+        if mode == "off":
+            return ["--off"]
+        return None
 
     def _call(self, method: str, *args) -> None:
         if self.controller and hasattr(self.controller, method):

@@ -1,4 +1,4 @@
-"""Generate assets/ajazzdock.ico from the tray glyph (multi-size for crisp display)."""
+"""Generate assets/hexpad.ico from the app glyph (multi-size for crisp display)."""
 import os
 import sys
 
@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dock.iconart import icon_image  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                   "assets", "ajazzdock.ico")
+                   "assets", "hexpad.ico")
 
 
 def main():

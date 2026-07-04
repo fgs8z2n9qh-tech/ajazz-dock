@@ -37,7 +37,7 @@ EDGE_INSET = 2             # px black frame: keep content off the device's ragge
 # The firmware anchors each key image to the TOP-RIGHT with a fixed dark margin on the
 # left/bottom (measured on-device). Shift the content down-left so it sits visually centred
 # with a symmetric border (tunable). paste-offset (x, y): negative x = left, positive y = down.
-CONTENT_SHIFT = (-4, 4)
+CONTENT_SHIFT = (-6, 8)
 
 # ---- input event codes (data[9]) -------------------------------------------
 _LCD_CODES = {0x01: 0, 0x02: 1, 0x03: 2, 0x04: 3, 0x05: 4, 0x06: 5}
@@ -75,22 +75,35 @@ class Event:
 
 def encode_key_image(img: Image.Image, rotation: int = 90, mirror: bool = False,
                      quality: int = 95, subsampling: int = 0,
-                     size=None, shift=None) -> bytes:
+                     size=None, shift=None, inset=None) -> bytes:
     """Convert a PIL image to the AKP03 on-wire JPEG (rotated 90deg).
 
-    `size`/`shift` override the module KEY_SIZE / CONTENT_SHIFT (used by the live calibrator);
-    normal rendering passes None and uses the current calibrated module values.
+    `size`/`shift`/`inset` override the module KEY_SIZE / CONTENT_SHIFT / EDGE_INSET (used by the
+    live calibrator); normal rendering passes None and uses the current calibrated module values.
+
+    The resulting JPEG is cached ON the source image object (keyed by geometry + quality), so a
+    cached STATIC face (see images._FACE_CACHE) re-uploaded on a page flip isn't re-encoded. Live /
+    animated faces are freshly rendered each frame → they simply never hit and their cache dies with
+    them: no global cache to grow, no id()-reuse hazard, auto-invalidated when the face re-renders.
     """
     sz = size or KEY_SIZE
     sh = CONTENT_SHIFT if shift is None else shift
+    ins = EDGE_INSET if inset is None else inset
+    ckey = (rotation, bool(mirror), quality, subsampling, tuple(sz), tuple(sh), ins)
+    src = img                                            # the (possibly cache-shared) source object
+    _jc = getattr(src, "_jpeg_cache", None)
+    if _jc is not None:
+        hit = _jc.get(ckey)
+        if hit is not None:
+            return hit
     w, h = sz
     img = img.convert("RGB")
     if img.size != sz:
         img = img.resize(sz, Image.LANCZOS)
-    if EDGE_INSET > 0:
+    if ins > 0:
         # Keep content off the device's ragged screen edge: scale the face down UNIFORMLY
         # (never per-axis — that distorts the aspect ratio) and centre it in a black tile.
-        f = min((w - 2 * EDGE_INSET) / w, (h - 2 * EDGE_INSET) / h)
+        f = min((w - 2 * ins) / w, (h - 2 * ins) / h)
         nw, nh = max(1, round(w * f)), max(1, round(h * f))
         framed = Image.new("RGB", sz, (0, 0, 0))
         framed.paste(img.resize((nw, nh), Image.LANCZOS), ((w - nw) // 2, (h - nh) // 2))
@@ -113,7 +126,14 @@ def encode_key_image(img: Image.Image, rotation: int = 90, mirror: bool = False,
     # Default quality 95 + 4:4:4 chroma: crisp edges on text/solids. Animation frames pass a
     # lower quality + chroma subsampling so the JPEG is much smaller -> faster transfer -> higher fps.
     img.save(buf, format="JPEG", quality=quality, subsampling=subsampling)
-    return buf.getvalue()
+    out = buf.getvalue()
+    try:                                                 # stash on the source face; a fresh face has
+        if _jc is None:                                  # no cache yet, a shared static face reuses it
+            _jc = src._jpeg_cache = {}
+        _jc[ckey] = out
+    except (AttributeError, TypeError):
+        pass                                             # exotic image object that won't take an attr
+    return out
 
 
 class AKP03:

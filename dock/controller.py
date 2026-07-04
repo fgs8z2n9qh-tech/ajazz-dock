@@ -1,6 +1,7 @@
 """DockController: bind device input events to actions and render pages."""
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -8,7 +9,17 @@ from typing import Any, Callable, Dict, List, Optional
 from .actions import ActionEngine
 from .config import LCD_KEYS, Config
 from .device import AKP03, Event
-from .images import render_face, press_frames, page_swipe_frames
+import os
+
+from . import live
+from .apppoller import ForegroundPoller
+from .images import (render_face, press_frames, page_swipe_frames, folder_face,
+                     folder_transition_frames, expand_gen, live_face, panel_frames,
+                     volume_hud_tiles, value_hud_tiles, ambient_clock_tiles, media_overflows,
+                     ambient_weather_tiles, ambient_now_playing_tiles,
+                     AMBIENT_ANIMATED, AMBIENT_STYLE_ORDER)
+
+_AMBIENT_WX_CYCLE = 14.0      # dynamic idle: seconds showing the clock, then the weather, repeat
 
 # Face shown on the last key while a folder sub-page is open.
 _BACK_FACE = {"label": "Back", "icon": "⬅️", "color": "#222a33"}
@@ -17,6 +28,17 @@ _BACK_FACE = {"label": "Back", "icon": "⬅️", "color": "#222a33"}
 # The final settle frame is re-rendered at full quality.
 _ANIM_Q = 72
 _ANIM_SS = 2
+_MARQUEE_SPEED = 70        # now-playing title scroll speed (supersampled px/sec) — slow + readable
+_MARQUEE_DT = 0.05         # ~20 fps refresh while a title scrolls
+# Encoder acceleration: turning a knob fast multiplies its step (so volume/brightness/scrub fly),
+# turning slowly stays 1:1 (fine control). A pause longer than the window resets to 1.
+_ENC_ACCEL_WINDOW = 0.09   # s; multiplier ~= window / gap-between-turns
+_ENC_ACCEL_MAX = 6         # cap so a flick can't overshoot wildly
+_ENC_ACCEL_DEFAULT = {"volume": 1, "brightness": 10, "monitor": 5, "appvolume": 5}
+# Multi-gesture keys: tap fires instantly on press UNLESS a double/hold is configured, in which
+# case we wait to disambiguate. A simple tap-only key keeps zero latency.
+_HOLD_T = 0.5              # s a key must be held to fire its 'hold' action
+_DOUBLE_T = 0.28          # s window to catch a second tap (double-tap)
 
 
 def _log_error(where: str, exc: BaseException) -> None:
@@ -53,6 +75,13 @@ class DockController:
 
         self.page_index = 0
         self._folder: Optional[str] = None    # id of the open folder sub-page, or None
+        self._folder_page = 0                 # current page index WITHIN the open folder
+        self._toggle_idx: Dict[str, int] = {}  # toggle-action keys -> current state index (in-memory)
+        self._last_key_index = 0              # last LCD key pressed (for the 'expand' folder anim)
+        self._folder_src = 0                  # key the open folder grew from
+        self._display_on = True               # dock screen on/off (long-press the middle button)
+        self._press = {}                      # input_id -> held-press state (gesture detection)
+        self._tap_pending = {}                # input_id -> a tap awaiting a possible double-tap
         self.connected = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -65,9 +94,46 @@ class DockController:
         self._anim = None                     # dict: index, page, frames, start, dur, last
         self._page_anim = None                # dict: frames(list of 6-face lists), start, dur, last
         self._pending_page = None             # (direction, new_index) requested from any thread
+        self._pending_switch = None           # (profile|None, page|None) from the app poller
+        self._last_manual_nav = 0.0           # time of the last hand-driven page change
+        self._poller = ForegroundPoller(self)  # app-aware auto-switching
         self._calib = None                    # (w, h, dx, dy) live display-calibration preview
         self._calib_dirty = False
         self._calib_active = False            # True only while the calibration dialog is open
+        self._panel = None                    # animated full-panel wallpaper state (or None)
+        self._volume_hud = None               # transient on-screen volume overlay (or None)
+        self._last_input = time.time()        # last dock input (for the idle/ambient timer)
+        self._ambient = None                  # ambient/idle screen state (or None when awake)
+        self._has_live = False                # current page has at least one live/dynamic key
+        self._live_last = 0.0                 # last live-key refresh timestamp
+        self._live_sig = {}                   # per-key last-pushed live signature (skip no-op redraws)
+        self._marquee = {}                    # key index -> {val, start} for a scrolling media title
+        self._marquee_last = 0.0
+        self._enc_last = {}                   # encoder index -> last turn time (for acceleration)
+        live.prime()                          # warm up the non-blocking CPU sampler
+        try:                                  # let the bulb-state live key reach the Tapo bulb
+            from .tapo import tapo_creds
+            _e, _p = tapo_creds(self.config)
+            live.set_tapo_creds(_e, _p)
+        except Exception:
+            pass
+        live.set_weather_units(self.config.data.get("weather_units", "c"))   # °C / °F
+        live.set_weather_location(self.config.data.get("weather", ""))   # city / "lat,lon" / "" = IP
+        try:                                  # wire the Discord app + its saved OAuth token
+            from . import discord
+            from .config import load_discord_token, save_discord_token
+            dc = self.config.data.get("discord", {})
+            tok, ref = load_discord_token()
+            discord.configure(dc.get("client_id", ""), dc.get("client_secret", ""),
+                              token=tok, refresh=ref, on_token=save_discord_token)
+        except Exception:
+            pass
+        try:                                  # wire OBS so its live-status keys can poll the WebSocket
+            from . import obs
+            o = self.config.data.get("obs", {})
+            obs.configure(o.get("host"), o.get("port"), o.get("password"))
+        except Exception:
+            pass
         self._apply_geometry()                # push config display-calibration into the render modules
 
     # ---- lifecycle ---------------------------------------------------------
@@ -77,9 +143,11 @@ class DockController:
         self._running = True
         self._thread = threading.Thread(target=self._run, name="dock-loop", daemon=True)
         self._thread.start()
+        self._poller.start()
 
     def stop(self) -> None:
         self._running = False
+        self._poller.stop()
         if self._thread:
             self._thread.join(timeout=2.0)
         try:
@@ -90,6 +158,121 @@ class DockController:
             pass
         self.dock.close()
 
+    # ---- display power (long-press the middle button) ----------------------
+    @staticmethod
+    def _nonempty_action(a) -> bool:
+        return isinstance(a, dict) and (a.get("type") or "none") not in ("none", "", None)
+
+    @staticmethod
+    def _gesture_action(binding, slot):
+        """The action for a gesture slot: 'tap' -> action, 'double' -> action_double, 'hold' -> action_hold."""
+        if not binding:
+            return None
+        return binding.get({"tap": "action", "double": "action_double", "hold": "action_hold"}[slot])
+
+    def _has_gestures(self, input_id: str, binding) -> bool:
+        """True if this input needs press/release disambiguation (a double or hold is configured —
+        or it's the middle button, which always has an implicit hold = toggle the screen)."""
+        if input_id == "btn8":
+            return True
+        return (self._nonempty_action(self._gesture_action(binding, "double"))
+                or self._nonempty_action(self._gesture_action(binding, "hold")))
+
+    def _check_gestures(self) -> None:
+        """Loop housekeeping: fire a hold once a key is held past _HOLD_T, and commit a pending tap
+        once its double-tap window has elapsed with no second press."""
+        now = time.time()
+        for iid, pr in list(self._press.items()):
+            if pr["hold_fired"] or now - pr["t"] < _HOLD_T:
+                continue
+            hold = self._gesture_action(pr["binding"], "hold")
+            if self._nonempty_action(hold):
+                pr["hold_fired"] = True
+                self._fire_action(hold, pr["index"], pr["kind"], animate=False)
+            elif iid == "btn8":                            # default middle-button hold = screen toggle
+                pr["hold_fired"] = True
+                self.toggle_display()
+        for iid, pend in list(self._tap_pending.items()):
+            if now - pend["t"] >= _DOUBLE_T:               # no second tap arrived -> it was a single
+                self._tap_pending.pop(iid, None)
+                self._fire_gesture(pend["kind"], pend["index"], pend["binding"], "tap")
+
+    def _anim_ok(self, kind: str, index: int) -> bool:
+        return (kind == "key" and self.connected and self.config.data.get("press_fx", True)
+                and not self._panel and index >= 0 and not self._opens_folder(index))
+
+    def _fire_action(self, action, index: int, kind: str, animate: bool = True) -> None:
+        """Run an action (if non-empty), then play the key's press bounce. action FIRST = snappy.
+        `animate=False` for deferred gesture fires (the physical press already bounced)."""
+        do_anim = animate and self._anim_ok(kind, index)
+        if isinstance(action, dict) and action.get("type") == "toggle":
+            self._fire_toggle(action, index, kind)
+        elif self._nonempty_action(action):
+            self.engine.execute(action)
+        if do_anim:
+            self._animate_key(index)
+
+    # ---- toggle action (one key alternating between N states) ---------------
+    def _toggle_key(self, index: int, kind: str) -> str:
+        """A stable per-binding id so each toggle key remembers its own state (in-memory)."""
+        prof = self.config.data.get("active_profile")
+        if kind == "key":
+            kid = LCD_KEYS[index] if 0 <= index < len(LCD_KEYS) else f"k{index}"
+            scope = f"f:{self._folder}:{self._folder_page}" if self._folder is not None else f"p:{self.page_index}"
+            return f"{prof}/{scope}/{kid}"
+        return f"{prof}/{kind}:{index}"
+
+    def _toggle_states(self, action):
+        return [s for s in (action.get("states") or []) if isinstance(s, dict)]
+
+    def _toggle_state_index(self, action, index: int, kind: str) -> int:
+        states = self._toggle_states(action)
+        if not states:
+            return 0
+        return self._toggle_idx.get(self._toggle_key(index, kind), 0) % len(states)
+
+    def _fire_toggle(self, action, index: int, kind: str) -> None:
+        states = self._toggle_states(action)
+        if not states:
+            return
+        tkey = self._toggle_key(index, kind)
+        i = self._toggle_idx.get(tkey, 0) % len(states)
+        sub = states[i].get("action") or {}
+        if self._nonempty_action(sub):
+            self.engine.execute(sub)
+        self._toggle_idx[tkey] = (i + 1) % len(states)   # advance, remember
+        if kind == "key" and 0 <= index < len(LCD_KEYS):  # repaint to show the NEW current state
+            try:
+                self.dock.set_key_pil(index, self._face_for_index(index))
+                self.dock.flush()
+            except OSError:
+                pass
+
+    def _fire_gesture(self, kind: str, index: int, binding, slot: str) -> None:
+        # deferred (release/double/expired-tap) -> no animation; the press already gave feedback
+        self._fire_action(self._gesture_action(binding, slot), index, kind, animate=False)
+
+    def toggle_display(self) -> None:
+        self.set_display(not self._display_on)
+
+    def set_display(self, on: bool) -> None:
+        """Turn the dock screen on (restore brightness + render) or off (dark + cleared)."""
+        self._display_on = bool(on)
+        if self.connected:
+            try:
+                if self._display_on:
+                    self.dock.set_brightness(self.config.brightness)
+                    self._render_requested = True
+                else:
+                    self._anim = None
+                    self.dock.set_brightness(0)
+                    self.dock.clear_all()
+                    self.dock.flush()
+            except OSError:
+                pass
+        if self.on_status:
+            self.on_status()
+
     # ---- the loop ----------------------------------------------------------
     def _run(self) -> None:
         while self._running:
@@ -99,9 +282,25 @@ class DockController:
                     continue
             try:
                 self._service_requests()
-                # Spin faster while an animation or live calibration is active.
-                busy = self._anim or self._page_anim or self._calib
-                ev = self.dock.read_event(timeout_ms=10 if busy else 200)
+                self._check_gestures()
+                # Spin faster while an animation/wallpaper/calibration runs, or while a gesture is
+                # pending (a held key awaiting hold, or a tap awaiting a possible double) so the
+                # 0.5s hold / 0.28s double resolve promptly. 10ms = true per-frame animations; the
+                # marquee is only 20fps so 40ms feeds it fine (it accumulates from capped elapsed dt).
+                # Animation terms are gated on the screen being ON so an OFF screen with stale state
+                # drops to 200ms; gesture polling is NOT gated so a hold can wake the screen.
+                on = self._display_on
+                # Fast-poll only while a gesture is still UNRESOLVED: a held key awaiting its hold,
+                # or a tap awaiting a double. Once the hold has fired we stop spinning (the release
+                # arrives as an event regardless of poll rate) — avoids a busy-wait during a long hold.
+                gesture = bool(self._tap_pending) or any(
+                    not pr["hold_fired"] for pr in self._press.values())
+                anim_idle = self._ambient is not None and self._ambient.get("anim")
+                fast = on and (self._anim or self._page_anim or self._calib or self._panel
+                               or self._volume_hud or anim_idle)   # animated idle needs ~15 fps
+                timeout = 10 if (fast or gesture) else (
+                    40 if (on and self._marquee) else 200)
+                ev = self.dock.read_event(timeout_ms=timeout)
                 if ev:
                     self._handle_event(ev)
             except OSError:
@@ -138,16 +337,28 @@ class DockController:
                 self.config = Config.load()
             self._apply_geometry()
             self._folder = None
+            self._folder_page = 0
             self._pending_brightness = self.config.brightness
             self._render_requested = True
         if self._pending_brightness is not None:
             b = self._pending_brightness
             self._pending_brightness = None
             self.dock.set_brightness(b)
+        # While the ambient/idle screen is showing, hold it and defer page/switch work until a wake.
+        if self._ambient is not None:
+            self._advance_ambient()
+            return
+        if self._pending_switch is not None:
+            sw = self._pending_switch
+            self._pending_switch = None
+            self._apply_app_switch(*sw)            # may set _pending_page, serviced just below
         if self._pending_page is not None:
-            direction, idx = self._pending_page
+            folder, direction, idx = self._pending_page
             self._pending_page = None
-            self._start_page_swipe(direction, idx)
+            self._start_page_swipe(folder, direction, idx)
+        if self._volume_hud is not None:
+            self._advance_volume_hud()
+            return                                # hold the HUD; don't draw the page/live over it
         # Render the calibration preview FIRST, then the page — so when both fire in one pass
         # (e.g. a preview tick landing right as the dialog closes), the normal page is always
         # the LAST thing written to the keys and the pattern can never win the final write.
@@ -171,6 +382,29 @@ class DockController:
             self._advance_anim()
         if self._page_anim:
             self._advance_page_anim()
+        if self._panel:
+            try:
+                self._advance_panel()
+            except Exception as e:
+                _log_error("advance_panel", e)
+        elif self._has_live and not self._anim and not self._page_anim:
+            now = time.time()
+            if now - self._live_last >= 1.0:
+                self._live_last = now
+                try:
+                    self._tick_live()
+                except OSError:
+                    raise
+                except Exception as e:
+                    _log_error("tick_live", e)
+            if self._marquee:                       # scroll a long now-playing title between ticks
+                try:
+                    self._advance_marquee()
+                except OSError:
+                    raise
+                except Exception as e:
+                    _log_error("marquee", e)
+        self._maybe_enter_ambient()                 # drop to the idle clock after enough idle time
 
     # ---- display geometry / calibration ------------------------------------
     def _apply_geometry(self) -> None:
@@ -182,9 +416,13 @@ class DockController:
         # Clamp the nudge so a stale/large saved shift can't crop the icon off the far edge.
         dx = max(-20, min(20, int(d.get("dx", 0))))
         dy = max(-20, min(20, int(d.get("dy", 0))))
+        ins = max(0, min(10, int(d.get("inset", 2))))
         images.KEY_SIZE = (w, h)
+        images.AUTO_ICONS = bool(self.config.data.get("auto_icons", True))
         device.KEY_SIZE = (w, h)
         device.CONTENT_SHIFT = (dx, dy)
+        device.EDGE_INSET = ins
+        images.clear_face_cache()      # geometry/auto-icon changes: drop stale-sized cached faces
 
     def begin_calibration(self) -> None:
         """Open a calibration session: only now will preview_calibration take effect."""
@@ -196,17 +434,17 @@ class DockController:
             return
         from .images import calib_pattern
         from .device import encode_key_image
-        w, h, dx, dy = self._calib
+        w, h, dx, dy, ins = self._calib
         try:
             jb = encode_key_image(calib_pattern((w, h)), self.dock.image_rotation,
-                                  self.dock.image_mirror, size=(w, h), shift=(dx, dy))
+                                  self.dock.image_mirror, size=(w, h), shift=(dx, dy), inset=ins)
             for i in range(len(LCD_KEYS)):
                 self.dock.set_key_image(i, jb)
             self.dock.flush()
         except OSError:
             pass
 
-    def preview_calibration(self, w: int, h: int, dx: int, dy: int) -> None:
+    def preview_calibration(self, w: int, h: int, dx: int, dy: int, inset: int = 2) -> None:
         """Live preview (any thread): show the centring target with these values.
 
         Ignored unless a calibration session is open — so a late debounced preview that
@@ -214,10 +452,10 @@ class DockController:
         """
         if not self._calib_active:
             return
-        self._calib = (int(w), int(h), int(dx), int(dy))
+        self._calib = (int(w), int(h), int(dx), int(dy), max(0, min(10, int(inset))))
         self._calib_dirty = True
 
-    def apply_calibration(self, w: int, h: int, dx: int, dy: int) -> None:
+    def apply_calibration(self, w: int, h: int, dx: int, dy: int, inset: int = 2) -> None:
         """Persist the calibration, apply it to the render pipeline, re-render."""
         # Close the session + leave calibration mode + request the page restore FIRST, so the
         # calib pattern is always cleared from the dock even if persisting the config throws.
@@ -227,9 +465,10 @@ class DockController:
         d = self.config.data.setdefault("display", {})
         d.pop("size", None)                       # superseded by independent w/h
         d["w"], d["h"], d["dx"], d["dy"] = int(w), int(h), int(dx), int(dy)
+        d["inset"] = int(inset)
         self._apply_geometry()
         self._render_requested = True
-        _log_debug(f"apply w={w} h={h} dx={dx} dy={dy} connected={self.connected}")
+        _log_debug(f"apply w={w} h={h} dx={dx} dy={dy} inset={inset} connected={self.connected}")
         try:
             self.config.save()
         except Exception as e:
@@ -248,34 +487,411 @@ class DockController:
         if self._folder is not None:
             folder = self.config.folders_of().get(self._folder)
             if folder is not None:
-                return folder.get("items", {})
+                pages = self.config._norm_folder(folder)["pages"]
+                self._folder_page = max(0, min(self._folder_page, len(pages) - 1))
+                return pages[self._folder_page].get("items", {})
             self._folder = None                     # folder was deleted -> fall back to page
         return self.config.page(self.page_index).get("items", {})
 
-    def _face_for_index(self, i: int):
-        # The last key is the auto 'Back' key whenever a folder is open.
-        if self._folder is not None and i == len(LCD_KEYS) - 1:
-            return render_face(_BACK_FACE, show_label=True)
+    def _face_for_index(self, i: int, live_val=None, scroll=None):
+        # The last key is the 'Back' key whenever a folder is open; its look is customisable
+        # per folder (folder['back']), its action stays fixed (return to the page).
+        if self._folder is not None and i == len(LCD_KEYS) - 1 and self._folder_back_is_key6():
+            folder = self.config.folders_of().get(self._folder, {})
+            back = {**_BACK_FACE, **(folder.get("back") or {})}
+            return render_face(back, show_label=back.get("show_label", True))
         item = self._current_items().get(LCD_KEYS[i]) or {}
         show = item.get("show_label", self.config.data.get("show_labels", True))
+        # A live/dynamic key renders its current value (clock, CPU, ...). live_val lets the caller
+        # pass an already-sampled value tuple so we don't double-sample (e.g. net rate) per tick.
+        if item.get("live"):
+            src = (item.get("live") or {}).get("source", "")
+            if src == "media" and live_val is None:        # read title + cover under ONE lock
+                text, caption, frac, art = live.media_snapshot()
+                kind = "media"
+            else:
+                text, caption, frac, kind = live_val if live_val is not None else live.value(src)
+                art = live.media_artwork() if kind == "media" else None
+            wx = live.weather_payload() if kind in ("weather", "wxmetric", "wxforecast") else None
+            return live_face(item, text, caption, frac, kind, show_label=show,
+                             style=self.config.data.get("live_style", "gauge"),
+                             history=live.history(src), scroll=scroll, artwork=art, weather=wx)
+        # A toggle key shows the look of its CURRENT state (so the dock reflects which way it's set).
+        action = item.get("action") or {}
+        if action.get("type") == "toggle":
+            states = self._toggle_states(action)
+            if states:
+                st = states[self._toggle_state_index(action, i, "key")]
+                face = {k: st.get(k) for k in ("label", "icon", "color", "text_color", "color2")
+                        if st.get(k) not in (None, "")}
+                return render_face(face, show_label=st.get("show_label", show))
+        # A folder key renders as a mini-grid of its contents (iOS/macOS-style tile).
+        if action.get("type") == "folder":
+            fid = action.get("folder")
+            f = self.config.folders_of().get(fid) if fid else None
+            # preview the folder's FIRST page in the mini-grid tile
+            contents = self.config._norm_folder(f)["pages"][0].get("items", {}) if f else {}
+            return folder_face(item, contents, show_label=show)
         return render_face(item, show_label=show)
 
     def _render_page(self) -> None:
-        if not self.connected:
-            _log_debug("render_page SKIPPED (not connected)")
+        if not self.connected or not self._display_on:
             return
+        self._live_sig.clear()                      # a full render invalidates the per-key live cache
+        self._marquee.clear()                       # re-evaluated by the next _tick_live
+        # Animated full-panel wallpaper (page-level) takes over all 6 keys, unless a folder is open.
+        panel = None if self._folder is not None else self.config.page(self.page_index).get("panel")
+        if panel and panel.get("path") and self._setup_panel(panel):
+            self._has_live = False
+            if self.on_status:
+                self.on_status()
+            return
+        self._panel = None
+        items = self._current_items()
         for i in range(len(LCD_KEYS)):              # key1..key6 -> device key 0..5
             self.dock.set_key_pil(i, self._face_for_index(i))
         self.dock.flush()
+        live_keys = list(LCD_KEYS)
+        if self._folder is not None and self._folder_back_is_key6():
+            live_keys = live_keys[:-1]              # the Back tile owns key6's slot in this mode
+        self._has_live = any((items.get(k) or {}).get("live") for k in live_keys)
+        self._live_last = time.time()
+        if self._has_live:
+            self._live_last = 0.0          # prime the next tick so a marquee starts scrolling at once
         if self.on_status:
             self.on_status()
+
+    # ---- full-panel wallpaper / animation ----------------------------------
+    def _setup_panel(self, panel: Dict[str, Any]) -> bool:
+        """Decode (and cache) the page's wallpaper frames, push the first one. False if missing."""
+        from . import images, device
+        path = panel.get("path")
+        if not path or not os.path.exists(path):
+            self._panel = None
+            return False
+        gap = int(panel.get("gap", 22))
+        # rotation/mirror AND the calibrated shift/inset are baked into the pre-encoded JPEGs, so a
+        # change to any of them must invalidate the cache (else a nudge/inset replays stale frames).
+        key = (path, images.KEY_SIZE, gap, self.page_index,
+               self.dock.image_rotation, self.dock.image_mirror,
+               device.CONTENT_SHIFT, device.EDGE_INSET)
+        if not self._panel or self._panel.get("key") != key:
+            try:
+                frames = panel_frames(path, gap=gap)
+            except Exception as e:
+                _log_error("panel_decode", e)
+                self._panel = None
+                return False
+            if not frames:
+                self._panel = None
+                return False
+            # Pre-encode every frame's 6 key JPEGs ONCE (a looping wallpaper plays the same bytes
+            # forever, so re-encoding per frame just burned CPU). Playback is then pure HID writes,
+            # and we drop the (larger) PIL tiles to save memory.
+            from .device import encode_key_image
+            rot, mir = self.dock.image_rotation, self.dock.image_mirror
+            jpeg = [[encode_key_image(t, rot, mir, _ANIM_Q, _ANIM_SS) for t in fr] for fr in frames]
+            self._panel = {"key": key, "jpeg": jpeg, "last": -1,
+                           "fps": max(1, min(60, int(panel.get("fps", 12)))),
+                           "start": time.time()}
+        self._advance_panel()
+        return True
+
+    def _advance_panel(self) -> None:
+        p = self._panel
+        if not p or not self.connected or not self._display_on:
+            return
+        jpeg = p["jpeg"]
+        if len(jpeg) <= 1:
+            if p["last"] == 0:
+                return                              # static wallpaper: push once
+            fi = 0
+        else:
+            fi = int((time.time() - p["start"]) * p["fps"]) % len(jpeg)
+            if fi == p["last"]:
+                return
+        p["last"] = fi
+        for i, jb in enumerate(jpeg[fi]):           # pre-encoded -> just upload, no re-encode
+            self.dock.set_key_image(i, jb)
+        self.dock.flush()
+
+    # ---- transient knob-feedback HUD (any encoder that changes a value) -----
+    def show_value_hud(self, value, name: str, *, muted: bool = False, accent=None,
+                       unit: str = "%", relative: int = 0, vmax: int = 100) -> None:
+        """Pop a knob-feedback overlay (name + value + bar) on the keys for ~1.3 s. `value` is a
+        0..vmax reading (vmax=200 for Discord output), or None with `relative` = ±1 when only the
+        direction is known (RGB etc.)."""
+        target = None if value is None else int(value)
+        prev = self._volume_hud
+        # Carry the eased displayed value across rapid re-emits of the SAME overlay so the bar glides
+        # continuously instead of restarting from the new target each tick.
+        if (prev and prev.get("name") == (name or "") and prev.get("disp") is not None
+                and target is not None):
+            disp = prev["disp"]
+        else:
+            disp = None if target is None else float(target)
+        self._volume_hud = {"value": target, "name": name or "",
+                            "muted": bool(muted), "accent": accent, "unit": unit,
+                            "relative": int(relative), "vmax": int(vmax),
+                            "start": time.time(), "dur": 1.3, "drawn": None,
+                            "disp": disp, "disp_t": time.time()}
+
+    def show_volume_hud(self, vol: int, muted: bool, name: str) -> None:
+        """Back-compat: a volume HUD is a value HUD (negative vol = unknown / relative)."""
+        self.show_value_hud(None if (vol is not None and vol < 0) else vol, name, muted=muted)
+
+    def _advance_volume_hud(self) -> None:
+        hud = self._volume_hud
+        if not hud:
+            return
+        if not self.connected or not self._display_on:
+            self._volume_hud = None
+            return
+        if time.time() - hud["start"] >= hud["dur"]:
+            self._volume_hud = None
+            self._render_page()                       # revert to the page
+            return
+        # Ease the DISPLAYED value toward the target so the bar + number glide smoothly between
+        # readings (frame-rate-independent). Snap on a big jump — a hue wrap (359->1) or a fast spin —
+        # so the bar never sweeps the long way round and fast turns stay responsive.
+        target = hud["value"]
+        disp = hud.get("disp")
+        if target is not None and disp is not None:
+            now = time.time()
+            dt = max(0.0, now - hud.get("disp_t", now))
+            hud["disp_t"] = now
+            gap = target - disp
+            if abs(gap) > hud["vmax"] * 0.5:
+                disp = float(target)
+            else:
+                disp += gap * (1.0 - math.exp(-dt / 0.055))
+                if abs(target - disp) < 0.4:
+                    disp = float(target)
+            hud["disp"] = disp
+            render_val = disp
+        else:
+            render_val = target                       # relative ▲/▼ or muted: nothing to ease
+        sig = (None if render_val is None else int(round(render_val)),
+               hud["muted"], hud["name"], hud["relative"], hud["accent"], hud["unit"], hud["vmax"])
+        if hud["drawn"] != sig:
+            hud["drawn"] = sig
+            try:
+                tiles = value_hud_tiles(render_val, hud["name"], muted=hud["muted"],
+                                        accent=hud["accent"], unit=hud["unit"],
+                                        relative=hud["relative"], vmax=hud["vmax"])
+                for i, tile in enumerate(tiles):
+                    self.dock.set_key_pil(i, tile, quality=_ANIM_Q, subsampling=_ANIM_SS)
+                self.dock.flush()
+            except OSError:
+                self._volume_hud = None
+
+    # ---- ambient / idle screen --------------------------------------------
+    def _maybe_enter_ambient(self) -> None:
+        """Drop to the idle clock once the dock has been untouched long enough — but never over an
+        animation, wallpaper, calibration preview or a live HUD."""
+        if self._ambient is not None or not self.connected or not self._display_on:
+            return
+        idle = self.config.data.get("idle", {})
+        if not idle.get("enabled", True):
+            return
+        if self._anim or self._page_anim or self._calib or self._panel or self._volume_hud:
+            return
+        delay = max(10, int(idle.get("delay", 120) or 120))
+        if time.time() - self._last_input >= delay:
+            self._enter_ambient()
+
+    def _enter_ambient(self) -> None:
+        idle = self.config.data.get("idle", {})
+        dim = max(2, min(int(self.config.brightness), int(idle.get("dim", 25) or 25)))
+        try:
+            self.dock.set_brightness(dim)               # dim for ambience + burn-in safety
+        except OSError:
+            return
+        self._ambient = {"start": time.time(), "sig": None, "last_anim": 0.0, "anim": False,
+                         "media_last": 0.0, "media_state": None, "np": None}
+        try:
+            self._advance_ambient()
+        except OSError:
+            self._ambient = None
+
+    def _ambient_style(self) -> str:
+        s = str((self.config.data.get("idle", {}) or {}).get("style", "classic") or "classic")
+        return s if s in AMBIENT_STYLE_ORDER else "classic"
+
+    def _ambient_media(self, now: float):
+        """Coalesced (≤1/s) now-playing read: (title, artist, art, playing) or None if idle."""
+        amb = self._ambient
+        if now - amb.get("media_last", 0.0) >= 1.0:
+            amb["media_last"] = now
+            title, artist, frac, art = live.media_snapshot()
+            playing = bool(frac and frac > 0.0)
+            amb["media_state"] = ((title, artist, art, playing)
+                                  if title and title != "--" else None)
+        return amb.get("media_state")
+
+    def _pick_ambient_layer(self, now: float) -> str:
+        """Dynamic idle: now-playing whenever music is actually playing, else the clock and
+        (optionally) the weather taking turns; otherwise just the chosen clock design."""
+        idle = self.config.data.get("idle", {})
+        if idle.get("playing", True):
+            st = self._ambient_media(now)
+            if st and st[3]:                                # something is playing -> cover takes over
+                self._ambient["np"] = st
+                return "playing"
+        if idle.get("weather", False) and live.weather_payload():
+            if int((now - self._ambient["start"]) / _AMBIENT_WX_CYCLE) % 2 == 1:
+                return "weather"
+        return "clock"
+
+    def _advance_ambient(self) -> None:
+        if not self.connected or not self._display_on:
+            self._ambient = None
+            return
+        now = time.time()
+        amb = self._ambient
+        lt = time.localtime(now)
+        hh, mm = time.strftime("%H", lt), time.strftime("%M", lt)
+        layer = self._pick_ambient_layer(now)
+        style = self._ambient_style()
+        animated = (layer == "playing") or (layer == "clock" and style in AMBIENT_ANIMATED)
+        amb["anim"] = animated                              # feeds the loop's 40 ms poll tier
+        if animated and now - amb.get("last_anim", 0.0) < 0.066:
+            return                                          # ~15 fps cap on moving layers
+        step = int((now - amb["start"]) / 25)               # nudge content every 25 s (burn-in)
+        drift = (step % 5 - 2, (step * 2) % 5 - 2)
+        phase = now - amb["start"]
+        try:
+            if layer == "playing":
+                amb["sig"] = None
+                amb["last_anim"] = now
+                title, artist, art, playing = amb["np"]
+                tiles = ambient_now_playing_tiles(title, artist, art, phase, playing,
+                                                  pos=live.media_position())
+            elif layer == "weather":
+                wx = live.weather_payload()
+                sig = ("wx", hh, mm, drift, wx.get("temp"), wx.get("feels"), wx.get("cond"),
+                       wx.get("night"), wx.get("hi"), wx.get("lo"), wx.get("label"))
+                if amb.get("sig") == sig:
+                    return
+                amb["sig"] = sig
+                tiles = ambient_weather_tiles(wx, hh, mm, drift=drift)
+            else:                                           # clock design (static or animated)
+                wd = time.strftime("%a", lt).upper()
+                day, mon = time.strftime("%d", lt), time.strftime("%b", lt).upper()
+                if animated:
+                    amb["last_anim"] = now
+                    amb["sig"] = None
+                else:
+                    sig = (hh, mm, wd, day, mon, drift, style)
+                    if amb.get("sig") == sig:
+                        return
+                    amb["sig"] = sig
+                tiles = ambient_clock_tiles(hh, mm, wd, day, mon, drift=drift,
+                                            style=style, phase=phase)
+            q, ss = (_ANIM_Q, _ANIM_SS) if animated else (92, 0)
+            for i, tile in enumerate(tiles):
+                self.dock.set_key_pil(i, tile, quality=q, subsampling=ss)
+            self.dock.flush()
+        except OSError:
+            self._ambient = None
+
+    def _wake_ambient(self) -> None:
+        """Leave the ambient screen: restore brightness and redraw the working page next pass."""
+        self._ambient = None
+        try:
+            self.dock.set_brightness(self.config.brightness)
+        except OSError:
+            pass
+        self._render_requested = True
+
+    def refresh_live(self) -> None:
+        """Force the live/dynamic keys to re-render on the very next loop pass (≤200 ms), instead of
+        waiting out the ~1 s cadence — used right after the dock toggles the bulb for instant feedback.
+        Thread-safe enough: a stale 0.0 only ever causes one extra (harmless) render."""
+        self._live_last = 0.0
+
+    def _tick_live(self) -> None:
+        """Re-render the visible view's live/dynamic keys — the page's, or the open folder's
+        (a Weather center / clock / mic-state key must keep ticking inside its folder). Called
+        ~once a second; skips the expensive render + JPEG encode + USB upload for any key whose
+        displayed value is unchanged since the last push."""
+        if not self.connected or self._panel or not self._display_on:
+            return
+        items = self._current_items()               # folder-aware: the open folder page's items
+        style = self.config.data.get("live_style", "gauge")
+        back6 = self._folder is not None and self._folder_back_is_key6()
+        pushed = False
+        for i, kid in enumerate(LCD_KEYS):
+            if back6 and i == len(LCD_KEYS) - 1:
+                continue                            # the Back tile owns this slot
+            item = items.get(kid)
+            if not (item and item.get("live")):
+                continue
+            src = (item.get("live") or {}).get("source", "")
+            val = live.value(src)                      # one sample per tick (keeps history fresh)
+            frac = val[2]
+            show = item.get("show_label", self.config.data.get("show_labels", True))
+            hist = tuple(live.history(src)) if style == "graph" else None
+            sig = (src, val[0], val[1], round(frac, 3) if frac is not None else None,
+                   val[3], style, show, hist)
+            if val[3] in ("weather", "wxmetric", "wxforecast"):
+                wx = live.weather_payload()            # the rich tile/atmospheric bg depend on the payload,
+                if wx:                                 # not just the text -> fold it in or the tile goes stale
+                    sig = sig + (wx.get("night"), wx.get("cond"), wx.get("label"),
+                                 wx.get("hi"), wx.get("lo"), wx.get("feels"))
+            # A long now-playing title scrolls — _advance_marquee OWNS this key's rendering, so we
+            # must NOT also push a static frame here (that's what made the title jump on every
+            # signature change, e.g. a play/pause flip). Just keep the marquee's state up to date.
+            if val[3] == "media" and media_overflows(val[0]):
+                prev = self._marquee.get(i)
+                if prev and prev["val"][0] == val[0]:
+                    prev["val"] = val                  # same title -> keep scroll position
+                else:
+                    self._marquee[i] = {"val": val, "offset": 0.0, "last": time.time()}
+                self._live_sig[i] = sig                # mark handled; the marquee does the drawing
+                continue
+            self._marquee.pop(i, None)
+            if self._live_sig.get(i) == sig:           # nothing changed -> don't touch the dock
+                continue
+            self.dock.set_key_pil(i, self._face_for_index(i, live_val=val))
+            self._live_sig[i] = sig
+            pushed = True
+        if pushed:
+            self.dock.flush()
+
+    def _advance_marquee(self) -> None:
+        """Scroll any overflowing now-playing title right->left (one key, like a light animation).
+        The offset accumulates per frame from the ELAPSED time CAPPED to one frame — so when the
+        marquee pauses (a key bounce / volume HUD blocks it) it resumes smoothly instead of jumping
+        forward to catch up."""
+        if not self._marquee or self._panel or not self._display_on:
+            return                                  # folders scroll too — _tick_live seeds them
+        now = time.time()
+        if now - self._marquee_last < _MARQUEE_DT:
+            return
+        self._marquee_last = now
+        items = self._current_items()
+        pushed = False
+        for i, m in list(self._marquee.items()):
+            item = items.get(LCD_KEYS[i])
+            if not (item and item.get("live")):
+                self._marquee.pop(i, None)
+                continue
+            dt = min(now - m.get("last", now), _MARQUEE_DT * 2)   # cap -> no catch-up jump on resume
+            m["last"] = now
+            m["offset"] = m.get("offset", 0.0) + dt * _MARQUEE_SPEED
+            self.dock.set_key_pil(i, self._face_for_index(i, live_val=m["val"], scroll=int(m["offset"])),
+                                  quality=_ANIM_Q, subsampling=_ANIM_SS)   # cheaper encode for a 20fps scroll
+            pushed = True
+        if pushed:
+            self.dock.flush()
 
     def _key_face(self, index: int):
         return self._face_for_index(index)
 
     def _animate_key(self, index: int) -> None:
         """Kick off a squash-and-stretch bounce on a key (frames stepped in the loop)."""
-        if not (0 <= index < len(LCD_KEYS)):
+        if not (0 <= index < len(LCD_KEYS)) or not self._display_on:
             return
         # If another key is still bouncing, snap it back to rest first.
         if self._anim and self._anim["index"] != index:
@@ -329,55 +945,169 @@ class DockController:
             return self.config.globals_of().get(input_id)
         return self.config.globals_of().get(input_id)            # round buttons: profile-global
 
+    def _encoder_accel(self, index: int) -> int:
+        """Multiplier for an encoder turn, based on how fast it's being spun (1 = slow / disabled)."""
+        if not self.config.data.get("encoder_accel", True):
+            return 1
+        now = time.time()
+        dt = now - self._enc_last.get(index, 0.0)
+        self._enc_last[index] = now
+        if dt > 0.18:                                   # a real pause -> back to fine control
+            return 1
+        return max(1, min(_ENC_ACCEL_MAX, int(round(_ENC_ACCEL_WINDOW / max(dt, 0.001)))))
+
+    def _scale_step(self, action, mult: int):
+        """Return a copy of a step-based encoder action with its step scaled by `mult`.
+        Only relative handlers read `step`, so this is a no-op for 'set'-style actions."""
+        if mult <= 1 or not isinstance(action, dict):
+            return action
+        t = (action.get("type") or "").lower()
+        has = action.get("step") not in (None, "")
+        if t in ("smartlight", "rgbscene"):
+            if not has:                                 # the dial setup always writes an explicit step
+                return action
+            base = int(action["step"])
+        elif t in _ENC_ACCEL_DEFAULT:
+            base = int(action["step"]) if has else _ENC_ACCEL_DEFAULT[t]
+        else:
+            return action
+        a = dict(action)
+        a["step"] = max(1, base) * mult
+        return a
+
+    def _folder_back_is_key6(self) -> bool:
+        return self.config.data.get("folder_back", "key6") == "key6"
+
+    def _opens_folder(self, index: int) -> bool:
+        """True if pressing key `index` enters or leaves a folder (its press bounce is wasted)."""
+        if self._folder is not None and index == len(LCD_KEYS) - 1 and self._folder_back_is_key6():
+            return True                            # the auto Back key
+        item = self._current_items().get(LCD_KEYS[index]) or {}
+        return (item.get("action") or {}).get("type") == "folder"
+
     def _handle_event(self, ev: Event) -> None:
-        if (ev.kind == "key" and ev.pressed and self.connected
-                and self.config.data.get("press_fx", True)):
-            self._animate_key(ev.index)
-        # The last key acts as 'Back' while a folder sub-page is open.
-        if (ev.kind == "key" and ev.pressed and self._folder is not None
-                and ev.index == len(LCD_KEYS) - 1):
-            self.folder_back()
+        # Any real input resets the idle timer. While the ambient screen is up, the FIRST input
+        # just wakes it (and is swallowed — it must NOT also fire the key's binding).
+        if ev.kind != "release_all":
+            self._last_input = time.time()
+            if self._ambient is not None:
+                self._wake_ambient()
+                return
+        if ev.kind == "key" and ev.pressed:
+            self._last_key_index = ev.index        # remember it for the 'expand' folder anim
+        if ev.kind == "release_all":               # a final 'all up' -> resolve any lingering presses
+            for iid in list(self._press.keys()):
+                self._resolve_release(iid)
+            return
+        # Exit a folder: the 6th key (default) OR a configured round button acts as 'Back' (no gestures
+        # on it). A round button keeps its normal action everywhere EXCEPT while a folder is open.
+        if self._folder is not None and ev.pressed:
+            fb = self.config.data.get("folder_back", "key6")
+            if ((fb == "key6" and ev.kind == "key" and ev.index == len(LCD_KEYS) - 1)
+                    or (fb in ("btn7", "btn8", "btn9") and ev.kind == "button" and ev.input_id == fb)):
+                self.folder_back()
+                return
+        if ev.kind == "encoder_turn":              # turns fire immediately (with acceleration)
+            binding = self._binding_for(ev.input_id)
+            mult = self._encoder_accel(ev.index)
+            if binding and mult > 1:
+                binding = {**binding, "action": self._scale_step(binding.get("action"), mult)}
+            if binding:
+                self.engine.execute(binding.get("action"))
             return
         if ev.kind in ("key", "button", "encoder_push"):
-            if not ev.pressed:
-                return
-            binding = self._binding_for(ev.input_id)
-        elif ev.kind == "encoder_turn":
-            binding = self._binding_for(ev.input_id)
-        else:
+            if ev.pressed:
+                self._on_press(ev)
+            else:
+                self._resolve_release(ev.input_id)
+
+    def _on_press(self, ev: Event) -> None:
+        iid = ev.input_id
+        binding = self._binding_for(iid)
+        if not self._has_gestures(iid, binding):
+            # tap-only input: fire instantly on press (action FIRST, then the press bounce) — the
+            # zero-latency common case, unchanged from before.
+            self._fire_action(binding.get("action") if binding else None, ev.index, ev.kind)
             return
-        if binding:
-            self.engine.execute(binding.get("action"))
+        # Multi-gesture input: bounce now for instant feedback; the action is disambiguated.
+        if self._anim_ok(ev.kind, ev.index):
+            self._animate_key(ev.index)
+        if iid in self._tap_pending and self._nonempty_action(self._gesture_action(binding, "double")):
+            self._tap_pending.pop(iid, None)       # a 2nd press inside the window -> double-tap
+            self._press[iid] = {"t": time.time(), "index": ev.index, "kind": ev.kind,
+                                "binding": binding, "hold_fired": True}   # consumed; release no-ops
+            self._fire_gesture(ev.kind, ev.index, binding, "double")
+            return
+        self._press[iid] = {"t": time.time(), "index": ev.index, "kind": ev.kind,
+                            "binding": binding, "hold_fired": False}
+
+    def _resolve_release(self, iid: str) -> None:
+        pr = self._press.pop(iid, None)
+        if pr is None or pr["hold_fired"]:
+            return                                 # hold already fired, or a double consumed this press
+        binding = pr["binding"]
+        if self._nonempty_action(self._gesture_action(binding, "double")):
+            # a double is configured -> wait out the window for a possible second tap
+            self._tap_pending[iid] = {"t": time.time(), "index": pr["index"],
+                                      "kind": pr["kind"], "binding": binding}
+        else:                                      # only a hold was configured and it didn't fire -> tap
+            self._fire_gesture(pr["kind"], pr["index"], binding, "tap")
 
     # ---- navigation (called by ActionEngine, in loop thread) ---------------
     def _page_count(self) -> int:
         return max(1, len(self.config.pages()))
 
+    def _folder_page_count(self) -> int:
+        f = self.config.folders_of().get(self._folder) if self._folder else None
+        return max(1, len(self.config._norm_folder(f)["pages"])) if f else 1
+
     def next_page(self) -> None:
-        self._folder = None
-        self._pending_page = (1, (self.page_index + 1) % self._page_count())
+        # Inside an open folder, page-switch flips the FOLDER's pages; otherwise the profile pages.
+        if self._folder is not None:
+            self._pending_page = (True, 1, (self._folder_page + 1) % self._folder_page_count())
+        else:
+            self._last_manual_nav = time.time()
+            self._pending_page = (False, 1, (self.page_index + 1) % self._page_count())
 
     def prev_page(self) -> None:
-        self._folder = None
-        self._pending_page = (-1, (self.page_index - 1) % self._page_count())
+        if self._folder is not None:
+            self._pending_page = (True, -1, (self._folder_page - 1) % self._folder_page_count())
+        else:
+            self._last_manual_nav = time.time()
+            self._pending_page = (False, -1, (self.page_index - 1) % self._page_count())
 
     def goto_page(self, index: int) -> None:
-        self._folder = None
-        idx = max(0, min(self._page_count() - 1, int(index)))
-        direction = 0 if idx == self.page_index else (1 if idx > self.page_index else -1)
-        self._pending_page = (direction, idx)
+        if self._folder is not None:
+            n = self._folder_page_count()
+            idx = max(0, min(n - 1, int(index)))
+            direction = 0 if idx == self._folder_page else (1 if idx > self._folder_page else -1)
+            self._pending_page = (True, direction, idx)
+        else:
+            self._last_manual_nav = time.time()
+            idx = max(0, min(self._page_count() - 1, int(index)))
+            direction = 0 if idx == self.page_index else (1 if idx > self.page_index else -1)
+            self._pending_page = (False, direction, idx)
 
-    def _start_page_swipe(self, direction: int, new_index: int) -> None:
-        """Render a phone-style horizontal swipe across all 6 keys on a page change."""
-        self._folder = None
+    def _start_page_swipe(self, folder: bool, direction: int, new_index: int) -> None:
+        """Phone-style horizontal swipe across all 6 keys on a page change — a profile page, or a
+        page WITHIN the open folder when `folder` is True."""
         self._anim = None                                 # cancel any key bounce
-        if (not self.connected or new_index == self.page_index
-                or not self.config.data.get("page_fx", True)):
-            self.page_index = new_index
+        cur = self._folder_page if folder else self.page_index
+
+        def _commit():
+            if folder:
+                self._folder_page = new_index
+            else:
+                self._folder = None                       # a profile-page switch exits any folder
+                self._folder_page = 0
+                self.page_index = new_index
+
+        if not self.connected or new_index == cur or not self.config.data.get("page_fx", True):
+            _commit()
             self._render_requested = True
             return
         old_faces = [self._face_for_index(i) for i in range(len(LCD_KEYS))]
-        self.page_index = new_index
+        _commit()
         new_faces = [self._face_for_index(i) for i in range(len(LCD_KEYS))]
         self._page_anim = {"frames": page_swipe_frames(old_faces, new_faces, direction, frames=16),
                            "start": time.time(), "dur": 0.018, "last": -1}
@@ -389,18 +1119,25 @@ class DockController:
         a = self._page_anim
         if not a:
             return
-        if not self.connected:
+        if not self.connected or not self._display_on:
             self._page_anim = None
             return
-        fi = int((time.time() - a["start"]) / a["dur"])
-        if fi >= len(a["frames"]):
+        n = a["n"] if "gen" in a else len(a["frames"])
+        total = a["dur"] * n
+        elapsed = time.time() - a["start"]
+        if elapsed >= total:
             self._page_anim = None
             self._render_page()                           # settle on the final page
             return
+        # OutQuad eased index over the SAME frames/duration: motion starts quick and settles soft
+        # instead of a robotic constant rate (pure timing — zero extra encodes / USB packets).
+        t = elapsed / total if total > 0 else 1.0
+        fi = min(n - 1, int((1.0 - (1.0 - t) * (1.0 - t)) * n))
         if fi != a["last"]:
             a["last"] = fi
             try:
-                for i, face in enumerate(a["frames"][fi]):
+                faces = a["gen"](fi) if "gen" in a else a["frames"][fi]  # lazy or pre-rendered
+                for i, face in enumerate(faces):
                     self.dock.set_key_pil(i, face, quality=_ANIM_Q, subsampling=_ANIM_SS)
                 self.dock.flush()
             except OSError:
@@ -408,24 +1145,85 @@ class DockController:
 
     def enter_folder(self, fid: str) -> None:
         if fid and fid in self.config.folders_of():
+            old = [self._face_for_index(i) for i in range(len(LCD_KEYS))] if self.connected else None
+            self._folder_src = self._last_key_index        # the folder grows from the pressed key
             self._folder = fid
-            self._render_requested = True
+            self._folder_page = 0                          # always open a folder at its first page
+            self._start_folder_anim(old, opening=True)
 
     def folder_back(self) -> None:
         if self._folder is not None:
+            old = [self._face_for_index(i) for i in range(len(LCD_KEYS))] if self.connected else None
             self._folder = None
-            self._render_requested = True
+            self._folder_page = 0
+            self._start_folder_anim(old, opening=False)
+
+    def _start_folder_anim(self, old_faces, opening: bool) -> None:
+        """Play a zoom transition for the folder open/close (reuses the page-anim stepper)."""
+        if (not self.connected or old_faces is None
+                or not self.config.data.get("page_fx", True)):
+            self._render_requested = True                  # transitions off -> just snap
+            return
+        new_faces = [self._face_for_index(i) for i in range(len(LCD_KEYS))]
+        self._anim = None                                  # cancel any in-flight key bounce
+        name = self.config.data.get("folder_anim", "zoom")
+        if name == "expand":
+            # generate frames lazily (one per displayed step) so it starts instantly instead of
+            # stalling ~100ms while all frames are pre-rendered.
+            n, gen = expand_gen(old_faces, new_faces, opening, 14, self._folder_src)
+            self._page_anim = {"gen": gen, "n": n, "start": time.time(), "dur": 0.020, "last": -1}
+        else:
+            frames = folder_transition_frames(old_faces, new_faces, opening, name=name,
+                                              src=self._folder_src, frames=14)
+            self._page_anim = {"frames": frames, "start": time.time(), "dur": 0.018, "last": -1}
+        self._advance_page_anim()
+        if self.on_status:
+            self.on_status()
 
     def set_profile(self, name: str) -> None:
         if name and self.config.set_active_profile(name):
             self._folder = None
+            self._folder_page = 0
             self.page_index = 0
             self.config.save()
             self._render_requested = True
 
+    # ---- app-aware auto-switching ------------------------------------------
+    def request_app_switch(self, profile: Optional[str], page) -> None:
+        """Called from the poller thread; the loop applies it (with suppression) next tick."""
+        self._pending_switch = (profile, page)
+
+    def _apply_app_switch(self, profile: Optional[str], page) -> None:
+        # Don't yank the dock out from under the user: skip while a folder/animation is up or
+        # right after a hand-driven page change.
+        if self._folder is not None or self._page_anim or self._anim:
+            return
+        if time.time() - self._last_manual_nav < 4.0:
+            return
+        if profile and profile != self.config.data.get("active_profile"):
+            self.set_profile(profile)
+        if page is not None:
+            try:
+                idx = max(0, min(self._page_count() - 1, int(page)))
+            except (TypeError, ValueError):
+                idx = self.page_index
+            if idx != self.page_index:
+                self._folder = None
+                self._folder_page = 0
+                direction = 1 if idx > self.page_index else -1
+                self._pending_page = (False, direction, idx)   # animated swipe, this same pass
+        if self.on_status:
+            self.on_status()
+
     def set_brightness(self, value: int) -> None:
         self.config.brightness = int(value)
         self.config.save()
+        self._pending_brightness = self.config.brightness
+
+    def set_brightness_live(self, value: int) -> None:
+        """Apply brightness to the device WITHOUT saving — for a slider drag (the GUI debounces the
+        save). The loop tracks the slider instantly via _pending_brightness; disk I/O is deferred."""
+        self.config.brightness = int(value)
         self._pending_brightness = self.config.brightness
 
     def adjust_brightness(self, delta: int) -> None:
