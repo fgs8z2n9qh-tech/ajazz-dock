@@ -9,7 +9,7 @@ Write-Host "Generating app icon..." -ForegroundColor Cyan
 & $vpy "$root\tools\make_icon.py"
 
 Write-Host "Building Hexpad.exe..." -ForegroundColor Cyan
-& $vpy -m PyInstaller --noconfirm --clean --onefile --windowed --name Hexpad `
+& $vpy -m PyInstaller --noconfirm --clean --onedir --windowed --name Hexpad `
   --icon "$root\assets\hexpad.ico" `
   --uac-admin `
   --add-data "$root\dock\native\LibreHardwareMonitorLib.dll;." `
@@ -37,8 +37,8 @@ Write-Host "Building Hexpad.exe..." -ForegroundColor Cyan
   --distpath "$root\dist" --workpath "$root\build" --specpath "$root" `
   "$root\run.py"
 
-if (Test-Path "$root\dist\Hexpad.exe") {
-  Write-Host "`nBuilt: $root\dist\Hexpad.exe" -ForegroundColor Green
+if (Test-Path "$root\dist\Hexpad\Hexpad.exe") {
+  Write-Host "`nBuilt: $root\dist\Hexpad\Hexpad.exe (onedir folder - no per-launch unpack, faster startup)" -ForegroundColor Green
 } else {
   Write-Host "`nBuild failed - see PyInstaller output above." -ForegroundColor Red
 }

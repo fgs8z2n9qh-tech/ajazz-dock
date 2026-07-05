@@ -3,9 +3,9 @@
 # running (elevated) instance and register an elevated autostart task. Run build.ps1 first.
 # NB: your settings live in %APPDATA%\AjazzDock and are NOT touched by this rebrand.
 $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$src = Join-Path $root 'dist\Hexpad.exe'
-if (-not (Test-Path $src)) {
-  Write-Host "dist\Hexpad.exe not found - run ./build.ps1 first." -ForegroundColor Red
+$src = Join-Path $root 'dist\Hexpad'                 # onedir build: a folder, not a single .exe
+if (-not (Test-Path (Join-Path $src 'Hexpad.exe'))) {
+  Write-Host "dist\Hexpad\Hexpad.exe not found - run ./build.ps1 first." -ForegroundColor Red
   exit 1
 }
 
@@ -23,10 +23,13 @@ Get-Process Hexpad, AjazzDock -ErrorAction SilentlyContinue | Stop-Process -Forc
 Start-Sleep -Milliseconds 800
 
 $installDir = Join-Path $env:LOCALAPPDATA 'Hexpad'
+# Clear any previous install (an old single-exe onefile build, or a stale onedir) so no orphan
+# files linger, then copy the whole onedir folder in. (Settings live in %APPDATA%, untouched.)
+if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Copy-Item (Join-Path $src '*') $installDir -Recurse -Force
 
 $exe = Join-Path $installDir 'Hexpad.exe'
-Copy-Item $src $exe -Force
 $ico = Join-Path $root 'assets\hexpad.ico'
 $icoInstalled = Join-Path $installDir 'hexpad.ico'
 if (Test-Path $ico) { Copy-Item $ico $icoInstalled -Force }
