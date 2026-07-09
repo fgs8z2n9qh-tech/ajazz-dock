@@ -101,6 +101,19 @@ def _proc_running(name) -> bool:
     return False
 
 
+_rgb_run_cache = [0.0, False]                # [checked_at, running] — throttle _proc_running on dial spins
+
+
+def _rgb_proc_running() -> bool:
+    """Is the RGB helper (Prisma) up? Cached ~3s so a fast encoder spin doesn't re-enumerate every
+    process on each 0.12s coalesce window; the dimmers refresh it to True right after they launch it."""
+    now = time.monotonic()
+    if now - _rgb_run_cache[0] < 3.0:
+        return _rgb_run_cache[1]
+    _rgb_run_cache[0], _rgb_run_cache[1] = now, _proc_running(_RGB_PROC_NAMES)
+    return _rgb_run_cache[1]
+
+
 class _DiscordVol:
     """Coalesces encoder ticks for Discord mic/output volume: one worker accumulates the signed
     delta and applies it via the RPC pipe per rate-limit window, so a fast spin doesn't flood it."""
@@ -253,11 +266,15 @@ class _RgbDimmer:
             if d == 0:
                 continue
             try:
-                if not _proc_running(_RGB_PROC_NAMES):
+                if not _rgb_proc_running():
                     subprocess.Popen([exe, "--minimized"])
                     time.sleep(1.8)
+                    _rgb_run_cache[0], _rgb_run_cache[1] = time.monotonic(), True
                 sign = "+" if d > 0 else "-"
-                subprocess.Popen([exe, "--brightness", f"{sign}{abs(d)}"])
+                # Always pass --minimized: a running instance strips it before pipe-forwarding
+                # (Program.cs:136), and if the 3s run-cache was stale (Prisma just died) the
+                # misfired launch becomes a minimized primary instead of popping its window mid-spin.
+                subprocess.Popen([exe, "--minimized", "--brightness", f"{sign}{abs(d)}"])
             except Exception as e:
                 print(f"[rgbscene] {e}")
             time.sleep(0.12)          # rate-limit; coalesce ticks landing during this window
@@ -303,10 +320,11 @@ class _RgbHue:
             self._hue = (self._hue + d) % 360
             hexc = _hsv_to_hex(self._hue)
             try:
-                if not _proc_running(_RGB_PROC_NAMES):
+                if not _rgb_proc_running():
                     subprocess.Popen([exe, "--minimized"])
                     time.sleep(1.8)
-                subprocess.Popen([exe, "--effect", "static", "--color", hexc])
+                    _rgb_run_cache[0], _rgb_run_cache[1] = time.monotonic(), True
+                subprocess.Popen([exe, "--minimized", "--effect", "static", "--color", hexc])   # see dimmer note
             except Exception as e:
                 print(f"[rgbscene] {e}")
             time.sleep(0.12)          # rate-limit; coalesce ticks landing during this window
@@ -1105,7 +1123,7 @@ class ActionEngine:
                 if not _proc_running(_RGB_PROC_NAMES):     # no primary -> start it first
                     subprocess.Popen([exe, "--minimized"])
                     time.sleep(1.8)
-                subprocess.Popen([exe, *args])
+                subprocess.Popen([exe, "--minimized", *args])   # stripped when forwarded; no window pop on a TOCTOU miss
             except Exception as e:
                 print(f"[rgbscene] {e}")
 

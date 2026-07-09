@@ -297,10 +297,20 @@ class DockController:
                     pr.get("hold_pending") and not pr["hold_fired"]
                     for pr in self._press.values())
                 anim_idle = self._ambient is not None and self._ambient.get("anim")
+                # 10ms only for real per-frame work (animation/HUD/calib/panel) or a pending gesture.
                 fast = on and (self._anim or self._page_anim or self._calib or self._panel
-                               or self._volume_hud or anim_idle)   # animated idle needs ~15 fps
-                timeout = 10 if (fast or gesture) else (
-                    40 if (on and self._marquee) else 200)
+                               or self._volume_hud)
+                if fast or gesture:
+                    timeout = 10
+                elif on and anim_idle:                  # animated idle -> wake to the next ~15fps
+                    due = self._ambient.get("last_anim", 0.0) + 0.066 - time.time()   # frame, not 100Hz
+                    timeout = max(1, min(66, int(due * 1000)))
+                elif on and self._marquee:
+                    timeout = 40
+                elif on and self._ambient is not None:  # static idle clock -> 1s granularity is plenty
+                    timeout = 1000
+                else:
+                    timeout = 200
                 ev = self.dock.read_event(timeout_ms=timeout)
                 if ev:
                     self._handle_event(ev)
@@ -720,14 +730,27 @@ class DockController:
         return s if s in AMBIENT_STYLE_ORDER else "classic"
 
     def _ambient_media(self, now: float):
-        """Coalesced (≤1/s) now-playing read: (title, artist, art, playing) or None if idle."""
+        """Coalesced now-playing read: (title, artist, art, playing) or None. Poll fast (1s) while a
+        track is showing; while merely WATCHING for music to start, poll every 15s with one 2.5s
+        confirm re-poll after each wake. The slow poll's snapshot can be a stale pre-park value (the
+        sampler answers from cache the instant it is woken), so the confirm poll re-reads FRESH; and
+        15s — well past the 5s park grace + the sampler's 2s fetch cadence — lets the WinRT media
+        thread actually PARK for most of the cycle (6s barely exceeded the grace and parked nothing)."""
         amb = self._ambient
-        if now - amb.get("media_last", 0.0) >= 1.0:
+        st = amb.get("media_state")
+        if st and st[3]:
+            interval = 1.0                      # track showing -> keep title/cover/progress fresh
+        elif amb.get("media_confirm"):
+            interval = 2.5                      # sampler just woke from park -> re-read a FRESH value
+        else:
+            interval = 15.0                     # quiet watch -> the sampler parks most of the cycle
+        if now - amb.get("media_last", 0.0) >= interval:
             amb["media_last"] = now
             title, artist, frac, art = live.media_snapshot()
             playing = bool(frac and frac > 0.0)
             amb["media_state"] = ((title, artist, art, playing)
                                   if title and title != "--" else None)
+            amb["media_confirm"] = (not playing) and not amb.get("media_confirm")
         return amb.get("media_state")
 
     def _pick_ambient_layer(self, now: float) -> str:

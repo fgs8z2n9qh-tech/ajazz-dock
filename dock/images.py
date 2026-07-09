@@ -2133,6 +2133,28 @@ _FIELD_STYLES = {
 }
 
 
+@lru_cache(maxsize=64)
+def _ambient_text_overlay(txt, frac, col, w2, h2, dx, dy, S, halo):
+    """Cached transparent RGBA overlay for ONE ambient clock key (auto-fit text + soft dark halo).
+    A pure function of its args, so animated ambient frames reuse it — the strings change only
+    ~once/minute — instead of re-rasterising text + GaussianBlur every ~15fps frame."""
+    _probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    fs = int(h2 * frac)
+    while fs > int(h2 * 0.16) and _probe.textlength(txt, font=_font(fs)) > w2 * 0.86:
+        fs -= 2
+    cx, cy = w2 // 2 + dx * S, h2 // 2 + dy * S
+    ov = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
+    if halo:                                          # soft dark glow -> readable on any hue
+        hl = Image.new("L", (w2, h2), 0)
+        ImageDraw.Draw(hl).text((cx, cy), txt, font=_font(fs), anchor="mm", fill=175)
+        hl = hl.filter(ImageFilter.GaussianBlur(max(3, h2 // 16)))
+        glow = Image.new("RGBA", (w2, h2), (8, 10, 14, 255))
+        glow.putalpha(hl)
+        ov = Image.alpha_composite(ov, glow)
+    ImageDraw.Draw(ov).text((cx, cy), txt, font=_font(fs), anchor="mm", fill=(col[0], col[1], col[2], 255))
+    return ov
+
+
 def _ambient_grid_text(tiles, hh, mm, weekday, day, month, drift, S, *,
                        fill=(255, 255, 255), sub_fill=(235, 240, 245), halo=True):
     """Classic per-key clock text over background tiles: 21 | : | 47 / WED | 02 | JUL — every
@@ -2140,19 +2162,11 @@ def _ambient_grid_text(tiles, hh, mm, weekday, day, month, drift, S, *,
     canvas gap approximation, so grid-spanning digits got visibly chopped on the hardware.)"""
     spec = [(hh, 0.66, fill), (":", 0.66, fill), (mm, 0.66, fill),
             (weekday, 0.42, sub_fill), (day, 0.42, fill), (month, 0.42, sub_fill)]
+    dx, dy = int(drift[0]), int(drift[1])
     for tile, (txt, frac, col) in zip(tiles, spec):
         w2, h2 = tile.size
-        d = ImageDraw.Draw(tile)
-        fs = int(h2 * frac)
-        while fs > int(h2 * 0.16) and d.textlength(txt, font=_font(fs)) > w2 * 0.86:
-            fs -= 2
-        cx, cy = w2 // 2 + int(drift[0]) * S, h2 // 2 + int(drift[1]) * S
-        if halo:                                     # soft dark glow -> readable on any hue
-            hl = Image.new("L", (w2, h2), 0)
-            ImageDraw.Draw(hl).text((cx, cy), txt, font=_font(fs), anchor="mm", fill=175)
-            hl = hl.filter(ImageFilter.GaussianBlur(max(3, h2 // 16)))
-            tile.paste((8, 10, 14), None, hl)
-        d.text((cx, cy), txt, font=_font(fs), anchor="mm", fill=col)
+        ov = _ambient_text_overlay(txt, frac, tuple(col), w2, h2, dx, dy, S, halo)
+        tile.paste(ov, (0, 0), ov)                    # composite the cached text+halo onto the tile
 
 
 def _ambient_halo_text(tile, txt, frac, col, dx, dy, *, minfrac=0.14):
@@ -2477,6 +2491,19 @@ def _ambient_starfield(hh, mm, weekday, day, month, drift, phase):
     return [t.resize((kw, kh), Image.LANCZOS) for t in tiles]
 
 
+@lru_cache(maxsize=4)
+def _plasma_rad(pw, ph):
+    """Radial distance grid — constant for a fixed (pw,ph), so compute it once, not per frame."""
+    cxp, cyp = pw / 2.0, ph / 2.0
+    return [[math.hypot(x - cxp, y - cyp) for x in range(pw)] for y in range(ph)]
+
+
+@lru_cache(maxsize=2)
+def _plasma_palette(sat, val):
+    """256-entry hue LUT for the plasma (sat/val are constant) — replaces 6,864 hsv_to_rgb/frame."""
+    return tuple(tuple(int(c * 255) for c in colorsys.hsv_to_rgb(i / 256.0, sat, val)) for i in range(256))
+
+
 def _ambient_plasma(hh, mm, weekday, day, month, drift, phase):
     """Classic demoscene plasma — interfering sine fields whose hue flows over time. Computed at
     low res per frame then bilinear-upscaled (smooth colour fields lose nothing)."""
@@ -2485,17 +2512,17 @@ def _ambient_plasma(hh, mm, weekday, day, month, drift, phase):
     kw, kh = KEY_SIZE
     W, H = w * S, h * S
     pw, ph = 104, 66
-    cxp, cyp = pw / 2.0, ph / 2.0
+    rad = _plasma_rad(pw, ph)                     # cached radius grid (hypot is frame-invariant)
+    pal = _plasma_palette(0.62, 0.52)             # cached hue LUT
+    sinx = [math.sin(x / 8.0 + phase * 1.3) for x in range(pw)]   # per-x, hoisted out of the y-loop
+    sxy = [math.sin(k / 10.0 + phase * 0.9) for k in range(pw + ph)]
     px = []
     for y in range(ph):
         sy = math.sin(y / 6.5 + phase * 1.1)
+        radrow = rad[y]
         for x in range(pw):
-            v = (math.sin(x / 8.0 + phase * 1.3) + sy
-                 + math.sin((x + y) / 10.0 + phase * 0.9)
-                 + math.sin(math.hypot(x - cxp, y - cyp) / 7.0 - phase * 1.6))
-            hue = (v / 8.0 + 0.5 + phase * 0.04) % 1.0
-            r, g, b = colorsys.hsv_to_rgb(hue, 0.62, 0.52)
-            px.append((int(r * 255), int(g * 255), int(b * 255)))
+            v = sinx[x] + sy + sxy[x + y] + math.sin(radrow[x] / 7.0 - phase * 1.6)
+            px.append(pal[int((v / 8.0 + 0.5 + phase * 0.04) % 1.0 * 256) & 255])
     small = Image.new("RGB", (pw, ph))
     small.putdata(px)
     canvas = small.resize((W, H), Image.BILINEAR)

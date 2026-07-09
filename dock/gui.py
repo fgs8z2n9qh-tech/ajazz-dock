@@ -6744,16 +6744,16 @@ class ConfigWindow(QMainWindow):
         super().hideEvent(event)
 
 
-def build_tray(win: ConfigWindow, controller: DockController, do_quit) -> QSystemTrayIcon:
-    tray = QSystemTrayIcon(app_icon(), win)
+def build_tray(get_win, controller, do_quit, refresh_open_win, parent) -> QSystemTrayIcon:
+    tray = QSystemTrayIcon(app_icon(), parent)
     tray.setToolTip(APP_TITLE)
     menu = QMenu()
 
-    open_act = menu.addAction(menu_icon("app", win) or QIcon(), "Open Configurator")
-    open_act.triggered.connect(win.show_raise)
+    open_act = menu.addAction(menu_icon("app", menu) or QIcon(), "Open Configurator")
+    open_act.triggered.connect(lambda: get_win().show_raise())
     menu.addSeparator()
 
-    prof_menu = menu.addMenu(menu_icon("contact", win) or QIcon(), "Profile")
+    prof_menu = menu.addMenu(menu_icon("contact", menu) or QIcon(), "Profile")
 
     def rebuild_profiles():
         prof_menu.clear()
@@ -6762,25 +6762,25 @@ def build_tray(win: ConfigWindow, controller: DockController, do_quit) -> QSyste
             a = prof_menu.addAction(nm)
             a.setCheckable(True)
             a.setChecked(nm == active)
-            a.triggered.connect(lambda _=False, n=nm: (controller.set_profile(n), win.refresh(),
-                                                       win.select("key1")))
+            a.triggered.connect(lambda _=False, n=nm: (controller.set_profile(n), refresh_open_win()))
     prof_menu.aboutToShow.connect(rebuild_profiles)
 
-    menu.addAction(menu_icon("save", win) or QIcon(), "Backups…") \
-        .triggered.connect(lambda: (win.show_raise(), win._open_backups()))
-    menu.addAction(menu_icon("screen", win) or QIcon(), "Toggle dock screen") \
+    menu.addAction(menu_icon("save", menu) or QIcon(), "Backups…") \
+        .triggered.connect(lambda: (get_win().show_raise(), get_win()._open_backups()))
+    menu.addAction(menu_icon("screen", menu) or QIcon(), "Toggle dock screen") \
         .triggered.connect(controller.toggle_display)
-    menu.addAction(menu_icon("refresh", win) or QIcon(), "Reload config") \
+    menu.addAction(menu_icon("refresh", menu) or QIcon(), "Reload config") \
         .triggered.connect(controller.request_reload)
-    auto_act = menu.addAction(menu_icon("power", win) or QIcon(), "Start with Windows")
+    auto_act = menu.addAction(menu_icon("power", menu) or QIcon(), "Start with Windows")
     auto_act.setCheckable(True)
     auto_act.setChecked(autostart.is_enabled())
     auto_act.triggered.connect(lambda checked: (autostart.enable() if checked else autostart.disable()))
     menu.addSeparator()
-    menu.addAction(menu_icon("cancel", win) or QIcon(), "Quit").triggered.connect(do_quit)
+    menu.addAction(menu_icon("cancel", menu) or QIcon(), "Quit").triggered.connect(do_quit)
 
     tray.setContextMenu(menu)
-    tray.activated.connect(lambda reason: win.show_raise()
+    tray._menu = menu                                # keep the menu alive with the tray
+    tray.activated.connect(lambda reason: get_win().show_raise()
                            if reason == QSystemTrayIcon.Trigger or reason == QSystemTrayIcon.DoubleClick
                            else None)
     tray.show()
@@ -6889,21 +6889,49 @@ def main():
     server.listen(IPC_NAME)
 
     controller = DockController(Config.load())
-    win = ConfigWindow(controller)
+
+    bridge = Bridge()
+    controller.on_status = lambda: bridge.status.emit()
+
+    # Lazy configurator: on the autostart/tray path (start_hidden) the window is never shown, so
+    # defer building its ~500 widgets until the user first opens it — the tray appears sooner and
+    # ~20 MB isn't spent mirroring an off-screen UI on every 24/7 login.
+    _win = {"w": None}
+    _quitting = {"v": False}
+
+    def get_win():
+        w = _win["w"]
+        if w is None:
+            w = ConfigWindow(controller)
+            w._tray = tray
+            w._server = server
+            if _quitting["v"]:
+                w._quitting = True
+            bridge.status.connect(w.on_status, Qt.QueuedConnection)
+            _win["w"] = w
+            try:
+                w.on_status()                        # sync the connection indicator immediately
+            except Exception:
+                pass
+        return w
+
+    def refresh_open_win():
+        w = _win["w"]
+        if w is not None:
+            w.refresh()
+            w.select("key1")
 
     def do_quit():
-        win._quitting = True
+        _quitting["v"] = True
+        w = _win["w"]
+        if w is not None:
+            w._quitting = True
         try:
             controller.stop()
         finally:
             app.quit()
 
-    tray = build_tray(win, controller, do_quit)
-    win._tray = tray
-
-    bridge = Bridge()
-    controller.on_status = lambda: bridge.status.emit()
-    bridge.status.connect(win.on_status, Qt.QueuedConnection)
+    tray = build_tray(get_win, controller, do_quit, refresh_open_win, app)
 
     def _on_ipc():
         sock = server.nextPendingConnection()
@@ -6917,10 +6945,9 @@ def main():
             sock.flush()
             sock.waitForBytesWritten(300)
         else:
-            win.show_raise()
+            get_win().show_raise()
         sock.disconnectFromServer()
     server.newConnection.connect(_on_ipc)
-    win._server = server  # keep alive
 
     try:
         autostart.migrate()           # carry a legacy Run-key autostart over to the elevated task
@@ -6928,7 +6955,7 @@ def main():
         pass
     controller.start()
     if not start_hidden:
-        win.show()
+        get_win().show()
     return app.exec()
 
 

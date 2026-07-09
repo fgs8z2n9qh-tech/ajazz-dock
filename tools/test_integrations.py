@@ -89,7 +89,9 @@ popens = []
 actions._proc_running = lambda name: True
 actions.subprocess.Popen = lambda argv, *a, **k: popens.append(argv)
 e2._rgbscene({"mode": "color", "color": "00C8AA"}); time.sleep(0.2)
-assert popens and popens[-1][1:] == ["--effect", "static", "--color", "00C8AA"], popens
+assert popens and popens[-1][1:] == ["--minimized", "--effect", "static", "--color", "00C8AA"], popens
+# ^ --minimized on every CLI send: a running Prisma strips it before pipe-forwarding (Program.cs:136);
+#   on a stale run-cache miss the launch becomes a minimized primary instead of popping its window.
 print("OK handler shapes")
 
 # ---- 4) config defaults + migration ---------------------------------------------------------

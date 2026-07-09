@@ -717,22 +717,28 @@ def _light() -> Tuple[str, str, Optional[float]]:
 _rgb_lock = threading.Lock()
 _rgb_on: Optional[bool] = None
 _RGB_PROC = ("prisma.exe", "rgbcommander.exe")
-_rgb_run_cache = (0.0, True)                      # (checked_at, running) — throttle process_iter to ~2s
+_rgb_run_cache = (0.0, True)                      # (checked_at, running) — throttle process_iter to ~12s
 
 
 def set_rgb_state(on: Optional[bool]) -> None:
     """Optimistically record Prisma's on/off (Prisma can't be polled) so the RGB live key updates
     the instant the dock fires a colour/effect/off/toggle action."""
-    global _rgb_on
+    global _rgb_on, _rgb_run_cache
     with _rgb_lock:
         _rgb_on = on
+    if on:
+        # The dock just commanded (and possibly launched) Prisma — stamp the run cache as running
+        # so the live key flips ON instantly instead of holding the stale not-running verdict for
+        # a full TTL; the next TTL re-check corrects a failed launch. (A bare invalidation would
+        # re-check DURING refresh_live, before the ~1.8s launch completes, and re-cache False.)
+        _rgb_run_cache = (time.monotonic(), True)
 
 
 def _rgb_running() -> bool:
     global _rgb_run_cache
     at, val = _rgb_run_cache
     now = time.monotonic()
-    if now - at < 2.0:
+    if now - at < 12.0:                            # RGB on/off is a rare, user-driven event
         return val
     running = True
     if psutil is not None:
