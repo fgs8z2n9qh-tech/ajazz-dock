@@ -148,7 +148,7 @@ _ACTION_FLUENT = {
     "hotkey": "keyboard", "sound": "volume", "monitor": "screen", "obs": "record",
     "discord": "chat", "system": "power", "appvolume": "volume", "rgbhue": "light",
     "media": "play", "volume": "volume", "text": "keyboard", "quick": "bolt",
-    "toggle": "refresh", "http": "globe",
+    "toggle": "refresh", "http": "globe", "timer": "timer",
 }
 
 
@@ -1374,6 +1374,41 @@ def _coordish(s):
         float(p[0]); float(p[1]); return True
     except ValueError:
         return False
+
+
+def timer_face(shown_s: int, total_s: int, running: bool, finished: bool, flash_on: bool,
+               label: str = "", size: Optional[Tuple[int, int]] = None) -> Image.Image:
+    """A countdown / stopwatch key face: big MM:SS (H:MM:SS over an hour), a caption on top, a
+    remaining-fraction bar for countdowns, dim digits while paused, and a red flash while the
+    just-finished alarm is showing. Rendered by the CONTROLLER from its per-key timer state."""
+    w, h = size or KEY_SIZE
+    if finished and flash_on:
+        img = Image.new("RGB", (w, h), (186, 46, 42))            # alarm flash frame
+        fg, dim, bar_bg = (255, 255, 255), (255, 216, 212), (140, 30, 28)
+    else:
+        img = Image.new("RGB", (w, h), (14, 18, 24))
+        fg = (240, 245, 250) if (running or finished) else (150, 158, 168)   # dim when paused
+        dim, bar_bg = (120, 130, 142), (44, 52, 62)
+    d = ImageDraw.Draw(img)
+    s = max(0, int(shown_s))
+    txt = f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60:02d}:{s % 60:02d}"
+    d.text((w // 2, int(h * 0.46)), txt, font=_fit_font_h(d, txt, w * 0.90, h * 0.34),
+           anchor="mm", fill=fg)
+    cap = (label or ("TIMER" if total_s else "STOPWATCH")).upper()[:12]
+    d.text((w // 2, int(h * 0.13)), cap, font=_font(max(8, int(h * 0.115)), bold=True),
+           anchor="mm", fill=dim)
+    if total_s:                                                  # countdown: remaining-fraction bar
+        frac = max(0.0, min(1.0, s / float(total_s)))
+        bw, by, bh = int(w * 0.78), int(h * 0.80), max(3, h // 22)
+        x0 = (w - bw) // 2
+        d.rounded_rectangle([x0, by, x0 + bw, by + bh], radius=bh // 2, fill=bar_bg)
+        if frac > 0:
+            col = (236, 78, 70) if finished else (53, 224, 138)
+            d.rounded_rectangle([x0, by, x0 + int(bw * frac), by + bh], radius=bh // 2, fill=col)
+    elif not running and s > 0:                                  # paused stopwatch
+        d.text((w // 2, int(h * 0.82)), "PAUSED", font=_font(max(8, int(h * 0.10)), bold=True),
+               anchor="mm", fill=dim)
+    return img
 
 
 def live_face(item: Dict[str, Any], text: str, caption: str, frac: Optional[float], kind: str,

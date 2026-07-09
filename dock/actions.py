@@ -689,12 +689,15 @@ class ActionEngine:
         self._work_q.put(action)
 
     def _work_loop(self) -> None:
+        import gc
         while True:
             action = self._work_q.get()
             try:
                 self._dispatch(action)
             except Exception as e:
                 print(f"[action] error running {action!r}: {e}")
+            gc.collect()      # free this job's COM churn (pycaw) HERE, in a live apartment —
+            #                   never from the Qt thread's threshold GC (see _start_com_safe_gc)
 
     # ------------------------------------------------------------------
     def _dispatch(self, action: Dict[str, Any]) -> None:
@@ -789,6 +792,8 @@ class ActionEngine:
             self._appvolume(action)
         elif t == "obs":
             self._obs(action)
+        elif t == "timer":
+            pass          # stateful: handled by the controller (needs the per-key identity + face)
         elif t == "toggle":
             # Per-key toggling (state + face) lives in the controller; here (encoder/macro use) we
             # just fire the first non-empty state's action so it still does something sensible.
@@ -1144,6 +1149,10 @@ class ActionEngine:
                     self.controller.show_volume_hud(*res)
             except Exception as e:
                 print(f"[appvolume] {e}")
+            finally:
+                import gc
+                gc.collect()  # release this thread's COM session wrappers while its apartment
+                #               is still alive — after the thread dies they'd be dangling proxies
 
         threading.Thread(target=work, daemon=True).start()
 

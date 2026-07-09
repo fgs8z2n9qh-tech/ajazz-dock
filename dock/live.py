@@ -48,6 +48,7 @@ _META: Dict[str, Tuple[str, str]] = {
     "battery":   ("Battery %", "battery"),
     "net":       ("Network down KB/s", "net"),
     "net_up":    ("Network up KB/s", "net"),
+    "ping":      ("Internet latency / connection health", "gauge"),
     "uptime":    ("System uptime", "gauge"),
     "procs":     ("Process count", "gauge"),
     "mic":       ("Mic mute state", "state"),
@@ -94,7 +95,7 @@ LIVE_SHORT: Dict[str, str] = {
     "ram": "RAM used", "ram_gb": "RAM (GB)", "swap": "Swap",
     "gpu": "GPU load", "gpu_clock": "GPU clock", "gpu_temp": "GPU temp",
     "vram": "VRAM used", "vram_temp": "VRAM temp", "gpu_fan": "GPU fan",
-    "disk": "Disk", "net": "Net down", "net_up": "Net up",
+    "disk": "Disk", "net": "Net down", "net_up": "Net up", "ping": "Ping",
     "battery": "Battery", "uptime": "Uptime", "procs": "Processes",
     "mic": "Mic", "caps": "Caps Lock", "light": "Smart bulb", "rgb": "RGB lights",
     "discord": "Discord", "media": "Now playing",
@@ -117,7 +118,7 @@ LIVE_EMOJI: Dict[str, str] = {
     "ram": "🧠", "ram_gb": "📊", "swap": "💾",
     "gpu": "🎮", "gpu_clock": "⚡", "gpu_temp": "🌡️",
     "vram": "🎞️", "vram_temp": "🌡️", "gpu_fan": "🌀",
-    "disk": "💽", "net": "🔽", "net_up": "🔼",
+    "disk": "💽", "net": "🔽", "net_up": "🔼", "ping": "📶",
     "battery": "🔋", "uptime": "⏳", "procs": "🔢",
     "mic": "🎙️", "caps": "🔠", "light": "💡", "rgb": "🌈", "discord": "💬", "media": "🎵",
     "discord_mic": "🎙️", "discord_deaf": "🎧", "discord_voice": "📞", "discord_count": "👥",
@@ -133,7 +134,7 @@ LIVE_CATEGORIES = [
     ("Processor", ["cpu", "cpu_clock", "cpu_temp"]),
     ("Memory", ["ram", "ram_gb", "swap"]),
     ("Graphics", ["gpu", "gpu_clock", "gpu_temp", "vram", "vram_temp", "gpu_fan"]),
-    ("Storage & network", ["disk", "net", "net_up"]),
+    ("Storage & network", ["disk", "net", "net_up", "ping"]),
     ("Power & system", ["battery", "uptime", "procs"]),
     ("Status", ["mic", "caps", "light", "rgb"]),
     ("Discord", ["discord", "discord_mic", "discord_deaf", "discord_voice", "discord_count",
@@ -650,6 +651,55 @@ def _caps() -> Tuple[str, str, Optional[float]]:
         return ("ON" if on else "OFF"), "CAPS", (1.0 if on else 0.0)
     except Exception:
         return "--", "CAPS", None
+
+
+# ---- internet latency ("ping") — TCP connect timing, no ICMP/raw sockets needed ----------------
+_ping_lock = threading.Lock()
+_ping_ms: Optional[float] = None        # None = no sample yet; -1.0 = internet DOWN
+_ping_started = False
+_PING_HOST = ("1.1.1.1", 443)           # Cloudflare anycast edge: always up, geographically near
+
+
+def _start_ping_sampler() -> None:
+    global _ping_started
+    _touch("ping")
+    if _ping_started:
+        return
+    _ping_started = True
+
+    def run() -> None:
+        global _ping_ms
+        import socket
+        while True:
+            _park_if_idle("ping")
+            try:
+                t0 = time.perf_counter()
+                s = socket.create_connection(_PING_HOST, timeout=2.0)
+                val = (time.perf_counter() - t0) * 1000.0
+                s.close()
+            except OSError:
+                val = -1.0              # timeout / no route -> connection is down
+            except Exception:
+                val = None
+            with _ping_lock:
+                _ping_ms = val
+            time.sleep(2.0)
+
+    _arm_park("ping")
+    threading.Thread(target=run, name="ping-sampler", daemon=True).start()
+
+
+def _ping() -> Tuple[str, str, Optional[float]]:
+    """Round-trip latency of a TCP connect to 1.1.1.1:443 — a red-flag DOWN face when unreachable.
+    The gauge fills with latency (150 ms = full), and value() feeds the graph style's history."""
+    _start_ping_sampler()
+    with _ping_lock:
+        v = _ping_ms
+    if v is None:
+        return "--", "PING", None
+    if v < 0:
+        return "DOWN", "NET", 1.0       # pegged gauge + unmissable text while offline
+    return f"{int(round(v))}", "MS", max(0.0, min(1.0, v / 150.0))
 
 
 # Smart bulb state — polled by a slow background sampler (network call; don't hit it per tick).
@@ -1563,7 +1613,8 @@ _PROVIDERS: Dict[str, Callable[[], Tuple[str, str, Optional[float]]]] = {
     "gpu_clock": _gpu_clock, "gpu_fan": _gpu_fan, "ram_gb": _ram_gb, "swap": _swap,
     "disk": _disk, "battery": _battery, "net": _net, "net_up": _net_up,
     "uptime": _uptime, "procs": _procs,
-    "mic": _mic, "caps": _caps, "light": _light, "rgb": _rgb_state, "discord": _discord_src,
+    "mic": _mic, "caps": _caps, "light": _light, "rgb": _rgb_state, "ping": _ping,
+    "discord": _discord_src,
     "discord_mic": _discord_mic, "discord_deaf": _discord_deaf,
     "discord_voice": _discord_voice, "discord_count": _discord_count,
     "discord_invol": _discord_invol, "discord_outvol": _discord_outvol,

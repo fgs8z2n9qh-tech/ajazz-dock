@@ -125,7 +125,7 @@ def _acquire_singleton() -> bool:
 
 ACTION_TYPES = ["none", "open", "hotkey", "text", "media", "volume", "appvolume", "mic", "sound",
                 "discord", "substance", "quick", "system", "monitor", "smartlight", "rgbscene", "obs",
-                "page", "folder", "profile", "brightness", "macro", "toggle", "http"]
+                "page", "folder", "profile", "brightness", "macro", "toggle", "http", "timer"]
 # Prisma effect names (must match its CLI's TryParseEffect aliases).
 _RGB_EFFECTS = ["Rainbow", "Static", "ColorCycle", "Breathing", "Strobe", "Gradient",
                 "Comet", "Twinkle", "Ambient", "Fire", "Music", "Off"]
@@ -337,7 +337,7 @@ ACTION_LABELS = {
     "macro": "Macro (advanced)", "substance": "Substance 3D Painter",
     "quick": "Quick action", "smartlight": "Smart light (Tapo / Lumos)",
     "rgbscene": "RGB scene (Prisma)", "obs": "OBS Studio", "toggle": "Toggle (2 states)",
-    "http": "HTTP request (webhook)",
+    "http": "HTTP request (webhook)", "timer": "Timer / countdown",
 }
 _SHORT = {"none": "No action",
           "open": "Open", "hotkey": "Hotkey", "text": "Text", "media": "Media", "volume": "Volume",
@@ -345,14 +345,14 @@ _SHORT = {"none": "No action",
           "system": "System", "monitor": "Monitors", "page": "Page", "folder": "Folder",
           "profile": "Profile", "brightness": "Brightness", "macro": "Macro", "substance": "Painter",
           "quick": "Quick", "smartlight": "Light", "rgbscene": "RGB", "obs": "OBS", "toggle": "Toggle",
-          "http": "HTTP"}
+          "http": "HTTP", "timer": "Timer"}
 # Compact "what this control does" labels drawn INSIDE the knobs / round buttons on the stage.
 _CTRL_SHORT = {"open": "Open", "hotkey": "Key", "text": "Text", "media": "Media",
                "volume": "Volume", "appvolume": "App vol", "mic": "Mic", "sound": "Sound",
                "discord": "Discord", "system": "System", "monitor": "Screen", "page": "Page",
                "folder": "Folder", "profile": "Profile", "brightness": "Bright", "macro": "Macro",
                "substance": "Brush", "quick": "Quick", "smartlight": "Light", "rgbscene": "RGB",
-               "obs": "OBS", "http": "HTTP"}
+               "obs": "OBS", "http": "HTTP", "timer": "Timer"}
 
 # Icon + one-line description per action, and a category grouping — used by the searchable picker.
 ACTION_EMOJI = {
@@ -360,7 +360,7 @@ ACTION_EMOJI = {
     "appvolume": "🎚️", "mic": "🎙️", "sound": "🔉", "discord": "💬", "substance": "🎨",
     "quick": "⚡", "system": "🖥️", "monitor": "☀️", "smartlight": "💡", "rgbscene": "🌈", "obs": "🎬",
     "page": "📄", "folder": "📁", "profile": "👤", "brightness": "🔆", "macro": "🧩", "toggle": "🔁",
-    "http": "🌐",
+    "http": "🌐", "timer": "⏱️",
 }
 ACTION_DESC = {
     "none": "Clear this key — remove its action (do nothing)",
@@ -387,6 +387,7 @@ ACTION_DESC = {
     "macro": "Run a sequence of actions",
     "toggle": "One key, two actions — each press flips to the other",
     "http": "Send a web request (webhook / REST API)",
+    "timer": "Countdown or stopwatch, live on the key — tap starts / pauses, beeps at zero",
 }
 ACTION_CATEGORIES = [
     ("Apps & files", ["open"]),
@@ -396,7 +397,7 @@ ACTION_CATEGORIES = [
     ("Smart home & RGB", ["smartlight", "rgbscene"]),
     ("System & Windows", ["system", "monitor", "brightness", "quick", "discord"]),
     ("Dock navigation", ["page", "folder", "profile"]),
-    ("Advanced", ["macro", "toggle", "http"]),
+    ("Advanced", ["macro", "toggle", "http", "timer"]),
 ]
 COMMON_ACTIONS = ["open", "hotkey", "media", "volume", "appvolume", "mic", "smartlight", "page", "none"]
 # One-click starter bindings for an empty LCD key (showcase stateful + smart-home keys).
@@ -448,6 +449,10 @@ def _action_summary(item) -> str:
         host = urlparse(a.get("url", "")).netloc
         m = (a.get("method") or "GET").upper()
         return f"{m} {host}" if host else "HTTP"
+    if t == "timer":
+        if (a.get("mode") or "countdown") == "stopwatch":
+            return "Stopwatch"
+        return f"Timer {int(a.get('minutes', 0) or 0):02d}:{int(a.get('seconds', 0) or 0):02d}"
     detail = {"open": a.get("target"), "hotkey": a.get("keys"), "text": a.get("text"),
               "media": a.get("media"), "volume": a.get("volume"), "mic": a.get("mic"),
               "sound": a.get("file"), "discord": a.get("mode") or a.get("discord"), "system": a.get("system"),
@@ -2646,6 +2651,9 @@ class ConfigWindow(QMainWindow):
         self._hist_timer.setSingleShot(True)
         self._hist_timer.setInterval(450)
         self._hist_timer.timeout.connect(self._commit_history)
+        self._mirror_timer = QTimer(self)             # live keys tick in the editor while visible
+        self._mirror_timer.setInterval(1000)
+        self._mirror_timer.timeout.connect(self._tick_live_mirror)
         self._save_bridge = _SaveBridge()
         self._save_bridge.saved.connect(self._on_config_saved)     # queued -> GUI thread
         _real_save = self.cfg.save
@@ -4085,6 +4093,11 @@ class ConfigWindow(QMainWindow):
                         if st.get(k) not in (None, "")}
                 return self._overlay_gesture_badge(
                     render_face(face, show_label=st.get("show_label", show)), item)
+        if action.get("type") == "timer":             # editor preview: the configured duration face
+            dur = 0 if (action.get("mode") or "countdown") == "stopwatch" else \
+                max(1, int(action.get("minutes", 0) or 0) * 60 + int(action.get("seconds", 0) or 0))
+            return self._overlay_gesture_badge(
+                images.timer_face(dur, dur, False, False, False, label=item.get("label", "")), item)
         if action.get("type") == "folder":
             fid = action.get("folder")
             f = self.cfg.folders_of().get(fid) if fid else None
@@ -4583,6 +4596,26 @@ class ConfigWindow(QMainWindow):
         addb.clicked.connect(lambda: self._add_page())
         self.pages_row.addWidget(addb)
         self.pages_row.addStretch(1)
+
+    def _tick_live_mirror(self):
+        """WYSIWYG: re-render the visible page's LIVE tiles each second so the editor mirrors the
+        device instead of freezing at the last edit. Only runs while the window is visible (the
+        timer stops on hideEvent); non-live keys are untouched, and a wallpaper preview page is
+        skipped so the panel frame isn't overdrawn."""
+        if not self.isVisible():
+            return
+        if self.view_folder is None and (self.page().get("panel") or {}).get("path"):
+            return
+        items = self.items()
+        for kid, b in self.key_btns.items():
+            if self._is_back_key(kid):
+                continue
+            item = items.get(kid)
+            if item and item.get("live"):
+                try:
+                    b.set_face(self._face(item))
+                except Exception:
+                    pass
 
     def _refresh_all_slots(self):
         items = self.items()
@@ -5922,6 +5955,21 @@ class ConfigWindow(QMainWindow):
                           "POST / PUT / PATCH.", objectName="dim")
             hint.setWordWrap(True)
             form.addRow(hint)
+        elif t == "timer":
+            form.addRow("Mode", combo("mode", ["countdown", "stopwatch"], "countdown"))
+            form.addRow("Minutes", spin("minutes", 0, 180, 5))
+            form.addRow("Seconds", spin("seconds", 0, 59, 0))
+            bx = QCheckBox("Beep when the countdown hits zero")
+            bx.setChecked(a.get("beep", True) is not False)
+            bx.toggled.connect(lambda v: self._set_action(a, "beep", bool(v)))
+            form.addRow(bx)
+            form.addRow("Press does", combo("op", ["startpause", "reset"], "startpause"))
+            thint = QLabel("The key shows a live MM:SS with a progress bar. Tap = start / pause / "
+                           "resume; tapping a finished (flashing) timer resets it. Tip: add a second "
+                           "timer action with 'reset' on this key's HOLD gesture for hold-to-reset.",
+                           objectName="dim")
+            thint.setWordWrap(True)
+            form.addRow(thint)
         elif t == "quick":
             op_combo = QComboBox()
             op_combo.setFocusPolicy(Qt.StrongFocus)
@@ -6736,12 +6784,14 @@ class ConfigWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._mirror_timer.start()           # live tiles tick only while the window can be seen
         if not getattr(self, "_tb_themed", False):
             self._tb_themed = True
             _theme_titlebar(self)            # green the native Windows 11 title bar (once realised)
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        self._mirror_timer.stop()            # hidden to tray -> zero editor refresh work
 
 
 def build_tray(get_win, controller, do_quit, refresh_open_win, parent) -> QSystemTrayIcon:
@@ -6787,8 +6837,39 @@ def build_tray(get_win, controller, do_quit, refresh_open_win, parent) -> QSyste
     return tray
 
 
+def _start_com_safe_gc() -> None:
+    """Route ALL cyclic garbage collection to one CoInitialize'd background thread.
+
+    Root cause (crash.log, 15 identical faulthandler dumps 2026-07-05): comtypes COM wrappers
+    (pycaw audio objects) always sit in reference cycles, so they die in whichever thread happens
+    to trip the GC threshold — on the Qt GUI thread their IUnknown.Release() runs in the wrong COM
+    apartment and access-violates (a native, uncatchable crash: 'Garbage-collecting ... unknwn.py
+    Release' mid-eventFilter). gc.disable() stops threshold GC everywhere; this one COM-friendly
+    thread then collects every 5s — refcounting still frees everything acyclic instantly, cycles
+    just wait a few seconds to die on a COM-correct thread."""
+    import gc
+    gc.disable()
+
+    def loop():
+        import time as _t
+        try:
+            import comtypes                    # CoInitialize this thread so COM releases are legal
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        while True:
+            _t.sleep(5.0)
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, name="gc-collector", daemon=True).start()
+
+
 def main():
     start_hidden = ("--tray" in sys.argv) or ("--hidden" in sys.argv)
+    _start_com_safe_gc()                       # must run before any comtypes/pycaw object exists
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setWindowIcon(app_icon())

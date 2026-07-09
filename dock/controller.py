@@ -14,7 +14,7 @@ import os
 from . import live
 from .apppoller import ForegroundPoller
 from .images import (render_face, press_frames, page_swipe_frames, folder_face,
-                     folder_transition_frames, expand_gen, live_face, panel_frames,
+                     folder_transition_frames, expand_gen, live_face, panel_frames, timer_face,
                      volume_hud_tiles, value_hud_tiles, ambient_clock_tiles, media_overflows,
                      ambient_weather_tiles, ambient_now_playing_tiles,
                      AMBIENT_ANIMATED, AMBIENT_STYLE_ORDER)
@@ -77,6 +77,7 @@ class DockController:
         self._folder: Optional[str] = None    # id of the open folder sub-page, or None
         self._folder_page = 0                 # current page index WITHIN the open folder
         self._toggle_idx: Dict[str, int] = {}  # toggle-action keys -> current state index (in-memory)
+        self._timers: Dict[str, dict] = {}     # timer-action keys -> countdown/stopwatch state (in-memory)
         self._last_key_index = 0              # last LCD key pressed (for the 'expand' folder anim)
         self._folder_src = 0                  # key the open folder grew from
         self._display_on = True               # dock screen on/off (long-press the middle button)
@@ -207,6 +208,8 @@ class DockController:
         do_anim = animate and self._anim_ok(kind, index)
         if isinstance(action, dict) and action.get("type") == "toggle":
             self._fire_toggle(action, index, kind)
+        elif isinstance(action, dict) and action.get("type") == "timer":
+            self._fire_timer(action, index, kind)
         elif self._nonempty_action(action):
             self.engine.execute(action)
         if do_anim:
@@ -247,6 +250,97 @@ class DockController:
                 self.dock.flush()
             except OSError:
                 pass
+
+    # ---- timer action (countdown / stopwatch rendered live on the key) ------
+    @staticmethod
+    def _timer_dur(action) -> int:
+        if (action.get("mode") or "countdown").lower() != "countdown":
+            return 0                                   # stopwatch counts up from zero
+        return max(1, int(action.get("minutes", 0) or 0) * 60 + int(action.get("seconds", 0) or 0))
+
+    @staticmethod
+    def _timer_shown(st, now: float) -> float:
+        """Seconds to DISPLAY: remaining for a countdown, elapsed for a stopwatch."""
+        el = st["acc"] + ((now - st["t0"]) if st["running"] else 0.0)
+        return max(0.0, st["dur"] - el) if st["mode"] == "countdown" else el
+
+    def _fire_timer(self, action, index: int, kind: str) -> None:
+        """Tap state-machine: start -> pause -> resume; a tap on a FINISHED timer (or an op:'reset'
+        action, e.g. bound on the hold gesture) clears it back to the configured duration."""
+        tkey = self._toggle_key(index, kind)           # same stable per-binding identity as toggles
+        st = self._timers.get(tkey)
+        now = time.time()
+        if (action.get("op") or "startpause").lower() == "reset" or (st and st.get("fin_t")):
+            self._timers.pop(tkey, None)
+        elif st is None:                               # start
+            mode = (action.get("mode") or "countdown").lower()
+            self._timers[tkey] = {"mode": mode, "dur": self._timer_dur(action), "acc": 0.0,
+                                  "t0": now, "running": True, "fin_t": None, "_shown": None,
+                                  "beep": action.get("beep", True) is not False}
+        elif st["running"]:                            # pause
+            st["acc"] += now - st["t0"]
+            st["running"] = False
+        else:                                          # resume
+            st["t0"] = now
+            st["running"] = True
+        self._repaint_timer_keys()
+
+    def _advance_timers(self) -> None:
+        """Per-loop-pass tick: fire the alarm the moment a countdown hits zero (state is
+        timestamp-based, so timers on hidden pages still fire on time) and repaint visible
+        timer keys once per displayed second (2 Hz flash for ~6s after finishing)."""
+        if not self._timers:
+            return
+        now = time.time()
+        for st in list(self._timers.values()):
+            if (st["mode"] == "countdown" and st["running"] and not st.get("fin_t")
+                    and self._timer_shown(st, now) <= 0.0):
+                st["acc"] += now - st["t0"]
+                st["running"] = False
+                st["fin_t"] = now
+                if st.get("beep", True):
+                    self._timer_beep()
+                if self._ambient is not None:          # surface the keys so the flash is seen
+                    self._wake_ambient()
+        self._repaint_timer_keys()
+
+    def _repaint_timer_keys(self) -> None:
+        if (not self._timers or not self.connected or not self._display_on
+                or self._ambient is not None or self._panel or self._calib):
+            return
+        now = time.time()
+        for i in range(len(LCD_KEYS)):
+            st = self._timers.get(self._toggle_key(i, "key"))
+            if st is None:
+                continue
+            fin = bool(st.get("fin_t"))
+            flash = fin and (now - st["fin_t"] < 6.0) and (int(now * 2) & 1 == 0)
+            sig = (int(self._timer_shown(st, now)), st["running"], fin, flash)
+            if st.get("_shown") == sig:
+                continue                               # displayed second unchanged -> no USB write
+            st["_shown"] = sig
+            item = self._current_items().get(LCD_KEYS[i]) or {}
+            if (item.get("action") or {}).get("type") != "timer":
+                continue                               # stale state; the visible key changed
+            try:
+                self.dock.set_key_pil(i, timer_face(sig[0], st["dur"], st["running"], fin, flash,
+                                                    label=item.get("label", "")))
+                self.dock.flush()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _timer_beep() -> None:
+        def _bp():
+            try:
+                import winsound
+                for _ in range(3):                     # short attention pattern, no sound asset needed
+                    winsound.Beep(880, 170)
+                    winsound.Beep(1245, 240)
+                    time.sleep(0.10)
+            except Exception:
+                pass
+        threading.Thread(target=_bp, name="timer-beep", daemon=True).start()
 
     def _fire_gesture(self, kind: str, index: int, binding, slot: str) -> None:
         # deferred (release/double/expired-tap) -> no animation; the press already gave feedback
@@ -355,6 +449,7 @@ class DockController:
             b = self._pending_brightness
             self._pending_brightness = None
             self.dock.set_brightness(b)
+        self._advance_timers()                 # timers tick (and alarm) even while ambient is up
         # While the ambient/idle screen is showing, hold it and defer page/switch work until a wake.
         if self._ambient is not None:
             self._advance_ambient()
@@ -536,6 +631,17 @@ class DockController:
                 face = {k: st.get(k) for k in ("label", "icon", "color", "text_color", "color2")
                         if st.get(k) not in (None, "")}
                 return render_face(face, show_label=st.get("show_label", show))
+        # A timer key renders its live countdown/stopwatch state (configured duration when idle).
+        if action.get("type") == "timer":
+            st = self._timers.get(self._toggle_key(i, "key"))
+            now = time.time()
+            if st is None:
+                dur = self._timer_dur(action)
+                return timer_face(dur, dur, False, False, False, label=item.get("label", ""))
+            fin = bool(st.get("fin_t"))
+            flash = fin and (now - st["fin_t"] < 6.0) and (int(now * 2) & 1 == 0)
+            return timer_face(int(self._timer_shown(st, now)), st["dur"], st["running"], fin,
+                              flash, label=item.get("label", ""))
         # A folder key renders as a mini-grid of its contents (iOS/macOS-style tile).
         if action.get("type") == "folder":
             fid = action.get("folder")
