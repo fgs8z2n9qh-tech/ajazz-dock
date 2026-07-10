@@ -6838,33 +6838,23 @@ def build_tray(get_win, controller, do_quit, refresh_open_win, parent) -> QSyste
 
 
 def _start_com_safe_gc() -> None:
-    """Route ALL cyclic garbage collection to one CoInitialize'd background thread.
+    """Confine cyclic GC — and thus every comtypes COM Release — to ONE thread.
 
-    Root cause (crash.log, 15 identical faulthandler dumps 2026-07-05): comtypes COM wrappers
-    (pycaw audio objects) always sit in reference cycles, so they die in whichever thread happens
-    to trip the GC threshold — on the Qt GUI thread their IUnknown.Release() runs in the wrong COM
-    apartment and access-violates (a native, uncatchable crash: 'Garbage-collecting ... unknwn.py
-    Release' mid-eventFilter). gc.disable() stops threshold GC everywhere; this one COM-friendly
-    thread then collects every 5s — refcounting still frees everything acyclic instantly, cycles
-    just wait a few seconds to die on a COM-correct thread."""
+    A comtypes IUnknown.Release() from a thread other than the one that CREATED the object is a
+    native access violation, in STA or MTA alike (verified: crash.log dumps 'Garbage-collecting ...
+    comtypes Release' while adjusting volume fast; an MTA stress repro still AV'd). So ALL transient
+    audio COM is funnelled onto the actions '_ComAudio' thread, which ALSO runs the process's
+    gc.collect() — every pycaw object is created AND collected on that single thread. gc.disable()
+    stops threshold GC on every other thread (incl. Qt's) so none of them ever releases a COM object;
+    refcounting still frees acyclic objects instantly. (The mic endpoint is cached / never garbage,
+    so it can stay on its own sampler thread.)"""
     import gc
     gc.disable()
-
-    def loop():
-        import time as _t
-        try:
-            import comtypes                    # CoInitialize this thread so COM releases are legal
-            comtypes.CoInitialize()
-        except Exception:
-            pass
-        while True:
-            _t.sleep(5.0)
-            try:
-                gc.collect()
-            except Exception:
-                pass
-
-    threading.Thread(target=loop, name="gc-collector", daemon=True).start()
+    try:
+        from .actions import _ComAudio
+        _ComAudio.get()                        # start the single COM-owner + GC thread now
+    except Exception:
+        pass
 
 
 def main():

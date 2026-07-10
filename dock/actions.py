@@ -28,30 +28,108 @@ _VOLUME_KEYS = {"up": "volume up", "down": "volume down", "mute": "volume mute"}
 _HUD_MINT = "#35e08a"
 
 
+import queue as _queue
+
+
+class _ComAudio:
+    """The SINGLE owner thread for all transient pycaw/comtypes audio COM.
+
+    A comtypes IUnknown.Release() from a thread other than the object's creator is a native access
+    violation (STA or MTA alike — verified). So every short-lived audio COM object created by
+    _system_volume() / _AppVolume is created, USED and cyclically COLLECTED on this one thread, which
+    also runs the process's gc.collect() (threshold GC is disabled everywhere else). Cross-thread
+    release can therefore never happen. The mic endpoint is cached (never garbage) so it is exempt."""
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._q = _queue.Queue()
+        threading.Thread(target=self._run, name="com-audio", daemon=True).start()
+
+    @classmethod
+    def get(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = _ComAudio()
+        return cls._instance
+
+    def _run(self):
+        import gc
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        last_gc = time.monotonic()
+        while True:
+            try:
+                job = self._q.get(timeout=2.0)
+            except _queue.Empty:
+                job = None
+            if job is not None:
+                fn, box = job
+                try:
+                    box[0] = fn()
+                except Exception as e:
+                    box[1] = e
+                finally:
+                    box[2].set()
+            now = time.monotonic()
+            if now - last_gc >= 2.0:               # bound COM garbage: collect on THIS thread ~2s
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+                last_gc = now
+
+    def call(self, fn, timeout=3.0):
+        box = [None, None, threading.Event()]
+        self._q.put((fn, box))
+        return box[0] if box[2].wait(timeout) else None
+
+
+def _audio(fn, timeout=3.0):
+    """Run a pycaw/COM callable on the single com-audio thread; returns its result (None on error or
+    timeout). Confines every audio COM object to that one thread so GC can release it safely there."""
+    return _ComAudio.get().call(fn, timeout)
+
+
+_sysvol_chain = None          # (enum, dev, iface, ep) kept ALIVE so the endpoint is never Released
+_sysvol_retired = []          # chains retired after a device change — kept alive too (see below)
+
+
 def _system_volume():
     """(percent 0..100, muted) of the default output device, or None if it can't be read.
 
-    Uses the MMDevice enumerator directly: newer pycaw's `GetSpeakers()` returns a wrapped
-    AudioDevice with no `.Activate()`, so we grab the raw default render endpoint (eRender=0,
-    eConsole=0) — the same device the volume keys control — exactly like _Mic's fallback."""
-    try:
-        import comtypes
+    Grabs the raw default render endpoint (eRender=0, eConsole=0) via the MMDevice enumerator, like
+    _Mic's fallback. CRITICAL: the endpoint is CACHED and a pycaw audio COM object is NEVER released
+    — comtypes double-Releases the aliased `cast()` interface pointer when it is freed (by refcount
+    OR by the cyclic GC), which is a native access violation (crash.log: dumps while adjusting volume
+    fast). The mic never crashed because its endpoint is likewise cached forever. So we keep every
+    endpoint alive for the process lifetime; a device change just retires the old chain (never frees
+    it). Reads reuse the cached endpoint -> zero new COM objects per call -> nothing for GC to free."""
+    def _impl():
+        global _sysvol_chain
         from ctypes import POINTER, cast
         from comtypes import CLSCTX_ALL, CoCreateInstance
         from pycaw.constants import CLSID_MMDeviceEnumerator
         from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
         from pycaw.pycaw import IAudioEndpointVolume
-        try:
-            comtypes.CoInitialize()
-        except OSError:
-            pass
-        enum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
-        dev = enum.GetDefaultAudioEndpoint(0, 0)          # eRender, eConsole = the default speakers
-        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        ep = cast(iface, POINTER(IAudioEndpointVolume))
-        return int(round(ep.GetMasterVolumeLevelScalar() * 100)), bool(ep.GetMute())
-    except Exception:
+        for _ in (1, 2):                                  # one rebuild if the cached device vanished
+            try:
+                if _sysvol_chain is None:
+                    enum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
+                    dev = enum.GetDefaultAudioEndpoint(0, 0)     # eRender, eConsole = default speakers
+                    iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                    _sysvol_chain = (enum, dev, iface, cast(iface, POINTER(IAudioEndpointVolume)))
+                ep = _sysvol_chain[3]
+                return int(round(ep.GetMasterVolumeLevelScalar() * 100)), bool(ep.GetMute())
+            except Exception:
+                if _sysvol_chain is not None:
+                    _sysvol_retired.append(_sysvol_chain)        # retire, don't free (double-Release)
+                    _sysvol_chain = None
         return None
+    return _audio(_impl)
 
 # "Quick actions": common Windows tasks as one-press presets. Most are really just a
 # standard system shortcut; the rest (recycle bin, clipboard, settings) need a real call.
@@ -512,7 +590,11 @@ class _AppVolume:
         return out, (name or "Volume")
 
     def apply(self, target, mode, step):
-        """Returns (volume_percent, muted, app_name) for the HUD, or None if nothing to control."""
+        """Returns (volume_percent, muted, app_name) for the HUD, or None. Runs entirely on the
+        com-audio thread so every session COM object is created + released there, never cross-thread."""
+        return _audio(lambda: self._apply_impl(target, mode, step))
+
+    def _apply_impl(self, target, mode, step):
         sess, name = self._sessions(target)
         if not sess:
             return None
@@ -689,15 +771,15 @@ class ActionEngine:
         self._work_q.put(action)
 
     def _work_loop(self) -> None:
-        import gc
         while True:
             action = self._work_q.get()
             try:
                 self._dispatch(action)
             except Exception as e:
                 print(f"[action] error running {action!r}: {e}")
-            gc.collect()      # free this job's COM churn (pycaw) HERE, in a live apartment —
-            #                   never from the Qt thread's threshold GC (see _start_com_safe_gc)
+            # NB: do NOT gc.collect() here — it releases COM objects from cycles regardless of which
+            # thread created them; under the MTA (run.py) and the single gc-collector thread that is
+            # handled safely. Calling it on this worker thread was the volume-spam crash regression.
 
     # ------------------------------------------------------------------
     def _dispatch(self, action: Dict[str, Any]) -> None:
@@ -1149,10 +1231,8 @@ class ActionEngine:
                     self.controller.show_volume_hud(*res)
             except Exception as e:
                 print(f"[appvolume] {e}")
-            finally:
-                import gc
-                gc.collect()  # release this thread's COM session wrappers while its apartment
-                #               is still alive — after the thread dies they'd be dangling proxies
+            # No gc.collect() here: the process MTA (run.py) makes these pycaw session wrappers
+            # agile, so the gc-collector thread can release them safely after this thread exits.
 
         threading.Thread(target=work, daemon=True).start()
 
