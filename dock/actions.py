@@ -504,6 +504,9 @@ def send_scancode_combo(spec: str) -> bool:
 
 
 # ---- microphone (Core Audio via pycaw) -------------------------------------
+_mic_retired = []          # invalidated capture endpoints kept alive (never freed -> no double-Release)
+
+
 class _Mic:
     """Lazily-bound default-communications capture endpoint volume control."""
 
@@ -541,20 +544,42 @@ class _Mic:
         self._endpoint = cast(iface, POINTER(IAudioEndpointVolume))
         return self._endpoint
 
+    def _retire(self) -> None:
+        # Drop the cached endpoint so the NEXT call re-binds to the current default capture device
+        # (after a mobo swap / audio-device change the old endpoint raises AUDCLNT_E_DEVICE_INVALIDATED
+        # forever). RETIRE, never free — comtypes double-Releases the cast()-aliased pointer, a native
+        # crash (same reason _system_volume caches + retires; the mic never crashed only because it
+        # never freed its endpoint). Rare event -> the leaked list stays tiny.
+        if self._endpoint is not None:
+            _mic_retired.append(self._endpoint)
+            self._endpoint = None
+
     def set(self, muted: bool) -> None:
-        self._ensure().SetMute(1 if muted else 0, None)
+        for _ in (1, 2):
+            try:
+                self._ensure().SetMute(1 if muted else 0, None)
+                return
+            except Exception:
+                self._retire()
 
     def toggle(self) -> bool:
-        ep = self._ensure()
-        new = 0 if ep.GetMute() else 1
-        ep.SetMute(new, None)
-        return bool(new)
+        for _ in (1, 2):
+            try:
+                ep = self._ensure()
+                new = 0 if ep.GetMute() else 1
+                ep.SetMute(new, None)
+                return bool(new)
+            except Exception:
+                self._retire()
+        return False
 
     def is_muted(self) -> Optional[bool]:
-        try:
-            return bool(self._ensure().GetMute())
-        except Exception:
-            return None
+        for _ in (1, 2):
+            try:
+                return bool(self._ensure().GetMute())
+            except Exception:
+                self._retire()
+        return None
 
 
 class _AppVolume:
