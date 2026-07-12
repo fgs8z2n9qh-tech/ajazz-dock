@@ -208,6 +208,19 @@ class AKP03:
         percent = max(0, min(100, int(percent)))
         self._write(self._cmd(b"LIG", bytes([0x00, 0x00, percent])))
 
+    def sleep(self) -> None:
+        """Put the panel into TRUE sleep — backlight fully off — via the HAN opcode (proto v3,
+        source mirajazz Device::sleep). Deeper than brightness 0, which on this panel only dims to
+        a minimum glow. The MCU stays alive (this is NOT shutdown), so input events keep flowing and
+        a key/button press still reaches the app; call wake() (or any render) to bring it back."""
+        self._ensure_init()
+        self._write(self._cmd(b"HAN"))
+
+    def wake(self) -> None:
+        """Re-assert display power (DIS) after sleep(). The caller restores brightness + re-renders."""
+        self._ensure_init()
+        self._write(self._cmd(b"DIS"))
+
     def set_key_image(self, key: int, jpeg: bytes) -> None:
         """Upload a JPEG (from encode_key_image) to LCD key 0..5. Call flush() after."""
         if not 0 <= key < LCD_KEYS:

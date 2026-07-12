@@ -7,11 +7,13 @@ from dock.device import Event
 
 class FakeDock:
     image_rotation, image_mirror = 90, False
-    def __init__(self): self.bright = None; self.cleared = 0; self.pushes = 0
+    def __init__(self): self.bright = None; self.cleared = 0; self.pushes = 0; self.slept = 0; self.woke = 0
     def set_brightness(self, b): self.bright = b
     def clear_all(self): self.cleared += 1
     def set_key_pil(self, *a, **k): self.pushes += 1
     def set_key_image(self, *a, **k): self.pushes += 1
+    def sleep(self): self.slept += 1                     # HAN: true backlight-off
+    def wake(self): self.woke += 1                       # DIS: re-assert display power
     def flush(self): pass
 
 data = default_config()
@@ -28,9 +30,11 @@ ck("starts on", c._display_on is True)
 c.set_display(False)
 ck("off -> _display_on False", c._display_on is False)
 ck("off -> brightness 0 + cleared", c.dock.bright == 0 and c.dock.cleared >= 1)
+ck("off -> HAN sleep sent (true backlight off)", c.dock.slept == 1)
 ck("off -> render gated", (c._render_page() or True) and c.dock.pushes == 0)
 c.set_display(True)
 ck("on -> brightness restored", c._display_on is True and c.dock.bright == 70)
+ck("on -> DIS wake sent", c.dock.woke == 1)
 
 # LONG press toggles the screen (btn8's implicit hold)
 before = c._display_on

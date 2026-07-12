@@ -350,11 +350,13 @@ class DockController:
         self.set_display(not self._display_on)
 
     def set_display(self, on: bool) -> None:
-        """Turn the dock screen on (restore brightness + render) or off (dark + cleared)."""
+        """Turn the dock screen on (wake + restore brightness + render) or off (cleared + HAN sleep,
+        backlight fully off). Input still flows while asleep, so the middle-button hold wakes it."""
         self._display_on = bool(on)
         if self.connected:
             try:
                 if self._display_on:
+                    self.dock.wake()                       # DIS: re-assert display power after HAN sleep
                     self.dock.set_brightness(self.config.brightness)
                     self._render_requested = True
                 else:
@@ -362,6 +364,7 @@ class DockController:
                     self.dock.set_brightness(0)
                     self.dock.clear_all()
                     self.dock.flush()
+                    self.dock.sleep()                      # HAN: backlight fully off (deeper than brightness 0)
             except OSError:
                 pass
         if self.on_status:
